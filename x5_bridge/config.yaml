@@ -1,0 +1,44 @@
+name: "X5 Bridge"
+version: "0.6.0"
+slug: "x5_bridge"
+description: "Escuta eventos locais do gateway Tuya X5 e cria dispositivos MQTT no Home Assistant."
+url: "https://github.com/joaov-meneses/home-assistant-x5-bridge/tree/main/x5_bridge"
+image: "ghcr.io/joaov-meneses/x5-bridge"
+stage: "experimental"
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+host_network: true
+hassio_api: true
+services:
+  - mqtt:need
+options:
+  x5_ip: ""
+  x5_device_id: ""
+  x5_local_key: ""
+  x5_version: 3.5
+  auto_sync: true
+  sync_interval_minutes: 10
+  tuya_region: "us-e"
+  tuya_access_id: ""
+  tuya_access_secret: ""
+  tuya_cloud_device_id: ""
+  create_unknown_dp_entities: true
+  topic_prefix: "x5"
+  debug: false
+schema:
+  x5_ip: str
+  x5_device_id: str
+  x5_local_key: password
+  x5_version: float
+  auto_sync: bool
+  sync_interval_minutes: int
+  tuya_region: str
+  tuya_access_id: str
+  tuya_access_secret: password
+  tuya_cloud_device_id: str
+  create_unknown_dp_entities: bool
+  topic_prefix: str
+  debug: bool

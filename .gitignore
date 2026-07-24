@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+.venv/
+venv/
+
+# TinyTuya and local test files may contain device credentials.
+devices.json
+snapshot.json
+tinytuya.json
+tuya-raw.json
+
+# Local Home Assistant options and secrets.
+options.json
+secrets.yaml
