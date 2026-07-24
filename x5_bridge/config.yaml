@@ -4,7 +4,6 @@ slug: "x5_bridge"
 description: "Escuta eventos locais do gateway Tuya X5 e cria dispositivos MQTT no Home Assistant."
 url: "https://github.com/joaov-meneses/home-assistant-x5-bridge/tree/main/x5_bridge"
 image: "ghcr.io/joaov-meneses/x5-bridge"
-stage: "stable"
 arch:
   - amd64
 init: false
