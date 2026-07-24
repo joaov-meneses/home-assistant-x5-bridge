@@ -16,7 +16,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 
 def env(name: str, default: str = "") -> str:
@@ -331,10 +331,10 @@ def friendly_dp_name(code: str, fallback: str) -> str:
         "backlight_switch": "Luz de fundo",
         "countdown": "Temporizador",
         "sensitivity": "Sensibilidade",
-        "illuminance_sampling": "Intervalo de iluminancia",
-        "illuminance_interval": "Intervalo de iluminancia",
+        "illuminance_sampling": "Intervalo de iluminância",
+        "illuminance_interval": "Intervalo de iluminância",
         "motion_detection_sensitivity": "Sensibilidade de movimento",
-        "presence_sensitivity": "Sensibilidade de presenca",
+        "presence_sensitivity": "Sensibilidade de presença",
         "indicator": "Indicador",
         "led": "LED",
         "power_on_behavior": "Comportamento ao energizar",
@@ -543,7 +543,7 @@ def publish_gateway_discovery(client: mqtt.Client) -> None:
             component="binary_sensor",
             object_id="x5_bridge_connection",
             config={
-                "name": "Conexao local",
+                "name": "Conexão local",
                 "unique_id": "x5_bridge_connection",
                 "state_topic": AVAILABILITY_TOPIC,
                 "payload_on": "online",
@@ -556,7 +556,7 @@ def publish_gateway_discovery(client: mqtt.Client) -> None:
             component="sensor",
             object_id="x5_bridge_inventory",
             config={
-                "name": "Inventario",
+                "name": "Inventário",
                 "unique_id": "x5_bridge_inventory",
                 "state_topic": INVENTORY_TOPIC,
                 "value_template": "{{ value_json.count }}",
@@ -584,7 +584,7 @@ def add_last_event_entity(device: BridgeDevice) -> None:
         component="sensor",
         object_id=object_id,
         config={
-            "name": "Ultimo evento",
+            "name": "Último evento",
             "unique_id": object_id,
             "state_topic": f"{device.topic_base}/event",
             "value_template": "{{ value_json.received_at }}",
@@ -644,7 +644,7 @@ def add_motion_entity(device: BridgeDevice, dp_id: str) -> None:
     )
 
 
-def add_moisture_entity(device: BridgeDevice, dp_id: str, name: str = "Agua detectada") -> None:
+def add_moisture_entity(device: BridgeDevice, dp_id: str, name: str = "Água detectada") -> None:
     object_id = f"x5_{device.uid}_moisture_{dp_id}"
     device.entities[object_id] = EntitySpec(
         component="binary_sensor",
@@ -813,22 +813,31 @@ def add_number_sensor(
     )
 
 
-def add_enum_sensor(device: BridgeDevice, dp_id: str, object_suffix: str, name: str) -> None:
+def add_enum_sensor(
+    device: BridgeDevice,
+    dp_id: str,
+    object_suffix: str,
+    name: str,
+    value_template: str | None = None,
+) -> None:
     object_id = f"x5_{device.uid}_{object_suffix}_{dp_id}"
+    config = {
+        "name": name,
+        "unique_id": object_id,
+        "state_topic": f"{device.topic_base}/{object_suffix}/{dp_id}",
+        "availability_topic": AVAILABILITY_TOPIC,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "device": device.ha_device,
+    }
+    if value_template:
+        config["value_template"] = value_template
     device.entities[object_id] = EntitySpec(
         component="sensor",
         object_id=object_id,
         dp_id=dp_id,
         kind="enum",
-        config={
-            "name": name,
-            "unique_id": object_id,
-            "state_topic": f"{device.topic_base}/{object_suffix}/{dp_id}",
-            "availability_topic": AVAILABILITY_TOPIC,
-            "payload_available": "online",
-            "payload_not_available": "offline",
-            "device": device.ha_device,
-        },
+        config=config,
     )
 
 
@@ -903,14 +912,20 @@ def apply_known_product_profile(device: BridgeDevice) -> bool:
     # sensitivity, illuminance_sampling and battery. Tuya LAN reports the
     # rainwater enum as "none"/"presence" on some firmwares.
     if "zg_223z" in slugify(descriptor) or "rainwater_detection_sensor" in slugify(descriptor):
-        add_enum_sensor(device, "1", "rainwater", "Chuva")
+        add_enum_sensor(
+            device,
+            "1",
+            "rainwater",
+            "Chuva",
+            "{{ {'none': 'Sem chuva', 'presence': 'Chuva detectada'}.get(value | lower, value) }}",
+        )
         add_moisture_entity(device, "1", "Chuva detectada")
-        add_number_sensor(device, "102", "illuminance", "Iluminancia", "illuminance", "lx", "measurement", "illuminance")
+        add_number_sensor(device, "102", "illuminance", "Iluminância", "illuminance", "lx", "measurement", "illuminance")
         add_number_sensor(device, "2", "sensitivity", "Sensibilidade", None, None, "measurement", "number")
-        add_number_sensor(device, "101", "illuminance_sampling", "Intervalo de iluminancia", None, "min", "measurement", "number")
+        add_number_sensor(device, "101", "illuminance_sampling", "Intervalo de iluminância", None, "min", "measurement", "number")
         add_number_sensor(device, "104", "battery", "Bateria", "battery", "%", "measurement", "battery")
         add_number_control_entity(device, "2", "Sensibilidade", {"min": 0, "max": 9, "step": 1})
-        add_number_control_entity(device, "101", "Intervalo de iluminancia", {"min": 1, "max": 480, "step": 1}, "min")
+        add_number_control_entity(device, "101", "Intervalo de iluminância", {"min": 1, "max": 480, "step": 1}, "min")
         return True
 
     return False
@@ -925,6 +940,7 @@ def infer_entities(device: BridgeDevice) -> None:
         token in descriptor
         for token in ("rain", "water", "flood", "leak", "moisture", "chuva", "agua", "vazamento")
     )
+    looks_like_rain = any(token in descriptor for token in ("rain", "chuva"))
     apply_known_product_profile(device)
 
     for dp_id in sorted(mapping.keys(), key=lambda item: int(item) if str(item).isdigit() else str(item)):
@@ -938,11 +954,15 @@ def infer_entities(device: BridgeDevice) -> None:
         elif code in {"pir", "presence", "motion_state", "motion", "occupancy"}:
             add_motion_entity(device, dp_id)
         elif any(token in code for token in ("water", "flood", "leak", "rain", "moisture")):
-            add_moisture_entity(device, dp_id)
+            add_moisture_entity(
+                device,
+                dp_id,
+                "Chuva detectada" if "rain" in code or looks_like_rain else "Água detectada",
+            )
         elif looks_like_moisture and (
             code in {"switch", "alarm", "state", "status"} or dp_type in {"boolean", "enum"}
         ):
-            add_moisture_entity(device, dp_id)
+            add_moisture_entity(device, dp_id, "Chuva detectada" if looks_like_rain else "Água detectada")
         elif "battery_percentage" in code:
             add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
         elif code == "battery" or code.endswith("_battery"):

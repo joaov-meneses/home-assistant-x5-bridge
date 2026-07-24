@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2
+
+- Corrige a acentuação dos nomes exibidos, incluindo `Água detectada`, `Iluminância`,
+  `Intervalo de iluminância`, `Conexão local`, `Inventário` e `Último evento`.
+- Mantém o nome `Chuva detectada` ao aplicar o reconhecimento genérico de umidade.
+- Traduz os estados Tuya `none` e `presence` para `Sem chuva` e `Chuva detectada`.
+
 ## 0.6.1
 
 - Uniformiza DPs numericos de bateria como percentual no Home Assistant.
@@ -30,7 +37,7 @@
   - `text` para strings gravaveis.
 - Converte escala Tuya ao enviar comandos numericos.
 - Publica `writable_dps` no inventario MQTT para diagnostico.
-- Adiciona controles locais do `ZG-223Z`: sensibilidade e intervalo de iluminancia.
+- Adiciona controles locais do `ZG-223Z`: sensibilidade e intervalo de iluminância.
 - Remove os campos antigos `door_*` do schema de configuracao.
 
 ## 0.4.1
@@ -49,7 +56,7 @@
 
 ## 0.3.1
 
-- Reconhece sensores de chuva, agua, vazamento e inundacao como `binary_sensor` de umidade.
+- Reconhece sensores de chuva, água, vazamento e inundação como `binary_sensor` de umidade.
 - Normaliza estados comuns como `alarm`, `wet`, `leak`, `rain`, `normal` e `dry`.
 
 ## 0.3.0

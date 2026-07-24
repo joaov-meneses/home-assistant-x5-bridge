@@ -1,4 +1,4 @@
-# X5 Bridge 0.6.1
+# X5 Bridge 0.6.2
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 
@@ -60,6 +60,6 @@ Perfil local incluido:
 
 - Gateway X5: conexao local e inventario.
 - Dispositivos descobertos: ultimo evento.
-- DPs reconhecidos: porta, movimento, agua/chuva/vazamento, iluminancia, bateria, temperatura, umidade e switches.
+- DPs reconhecidos: porta, movimento, água/chuva/vazamento, iluminância, bateria, temperatura, umidade e switches.
 - DPs gravaveis reconhecidos: switches, numeros, selects e textos com comandos enviados de volta ao X5 por Tuya LAN.
 - DPs desconhecidos: entidades diagnosticas, quando `create_unknown_dp_entities` estiver ativo.
