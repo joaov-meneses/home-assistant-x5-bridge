@@ -1,4 +1,4 @@
-# X5 Bridge 0.6.0
+# X5 Bridge 0.6.1
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 

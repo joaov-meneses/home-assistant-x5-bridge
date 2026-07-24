@@ -16,7 +16,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 
 def env(name: str, default: str = "") -> str:
@@ -946,11 +946,9 @@ def infer_entities(device: BridgeDevice) -> None:
         elif "battery_percentage" in code:
             add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
         elif code == "battery" or code.endswith("_battery"):
-            max_value = mapping_values(mapping, dp_id).get("max")
-            if unit == "%" or max_value == 100:
-                add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
-            else:
-                add_number_sensor(device, dp_id, "battery", "Bateria", None, unit or None, "measurement", "battery")
+            # Tuya frequently omits unit/max metadata for percentage battery
+            # DPs. Treat numeric battery readings consistently in Home Assistant.
+            add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
         elif "temperature" in code or code in {"temp_current", "va_temperature"}:
             add_number_sensor(device, dp_id, "temperature", "Temperatura", "temperature", unit or "C", "measurement", "temperature")
         elif "humidity" in code or code in {"va_humidity"}:

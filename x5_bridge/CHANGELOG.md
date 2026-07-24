@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- Uniformiza DPs numericos de bateria como percentual no Home Assistant.
+- Aplica `device_class: battery` e unidade `%` mesmo quando a Tuya omite esses metadados.
+
 ## 0.6.0
 
 - Consulta os detalhes atuais de cada subdispositivo na Tuya Cloud.
