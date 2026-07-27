@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+- Corrige a falha de MQTT Discovery ao receber um DP desconhecido.
+- Reconhece cortinas Tuya pela categoria, pela especificação de DPs ou pelos
+  estados locais observados.
+- Cria uma entidade nativa `cover` com abrir, fechar, parar e controle de posição.
+- Remove entidades genéricas antigas dos DPs principais da cortina.
+- Enfileira comandos no loop da conexão local e os envia sem aguardar a resposta,
+  reduzindo a latência sem acessar o mesmo socket por múltiplas threads.
+- Reduz o intervalo de leitura do socket para 250 ms depois das consultas iniciais.
+- Executa a consulta periódica à Tuya Cloud em segundo plano para que ela não
+  bloqueie eventos nem comandos locais.
+- Solicita uma nova sincronização ao receber um evento de CID ainda desconhecido.
+
 ## 0.6.2
 
 - Corrige a acentuação dos nomes exibidos, incluindo `Água detectada`, `Iluminância`,

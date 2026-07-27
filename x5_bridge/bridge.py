@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import socket
@@ -16,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -60,9 +61,13 @@ GATEWAY_ONLINE = False
 LAST_AVAILABILITY_STATE = ""
 LAST_AVAILABILITY_AT = 0.0
 AVAILABILITY_REFRESH_SECONDS = 30.0
+LISTEN_POLL_SECONDS = 0.25
 
-OP_LOCK = threading.RLock()
 AVAILABILITY_LOCK = threading.Lock()
+COMMAND_QUEUE: queue.Queue[tuple[str, str, Any]] = queue.Queue()
+SYNC_RESULT_QUEUE: queue.Queue[tuple[list[dict[str, Any]] | None, Exception | None]] = queue.Queue()
+SYNC_THREAD_LOCK = threading.Lock()
+SYNC_THREAD: threading.Thread | None = None
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -255,6 +260,13 @@ def mapping_writable(mapping: dict[str, Any], dp_id: str) -> bool:
     return "w" in mode
 
 
+def dp_for_codes(mapping: dict[str, Any], codes: set[str]) -> str:
+    for dp_id in mapping:
+        if mapping_code(mapping, str(dp_id)) in codes:
+            return str(dp_id)
+    return ""
+
+
 def parse_mapping_values(dp_type: str, raw_values: Any) -> Any:
     if raw_values in ("", None):
         return {}
@@ -405,6 +417,12 @@ class BridgeDevice:
     last_dps: dict[str, Any] = field(default_factory=dict)
     discovered_raw_dps: set[str] = field(default_factory=set)
     entities: dict[str, EntitySpec] = field(default_factory=dict)
+    obsolete_discovery_topics: set[str] = field(default_factory=set)
+    cover_cleanup_done: bool = False
+    cover_control_dp: str = ""
+    cover_position_control_dp: str = ""
+    cover_position_state_dp: str = ""
+    cover_work_state_dp: str = ""
 
     @property
     def uid(self) -> str:
@@ -417,6 +435,19 @@ class BridgeDevice:
     @property
     def topic_base(self) -> str:
         return f"{TOPIC_PREFIX}/devices/{self.uid}"
+
+    @property
+    def cover_dp_ids(self) -> set[str]:
+        return {
+            dp_id
+            for dp_id in (
+                self.cover_control_dp,
+                self.cover_position_control_dp,
+                self.cover_position_state_dp,
+                self.cover_work_state_dp,
+            )
+            if dp_id
+        }
 
     @property
     def ha_device(self) -> dict[str, Any]:
@@ -778,6 +809,75 @@ def add_text_entity(device: BridgeDevice, dp_id: str, name: str) -> None:
     )
 
 
+def add_cover_entity(
+    device: BridgeDevice,
+    control_dp: str,
+    position_control_dp: str = "",
+    position_state_dp: str = "",
+    work_state_dp: str = "",
+) -> None:
+    if not control_dp:
+        return
+    device.cover_control_dp = control_dp
+    device.cover_position_control_dp = position_control_dp
+    device.cover_position_state_dp = position_state_dp
+    device.cover_work_state_dp = work_state_dp
+
+    object_id = f"x5_{device.uid}_cover"
+    for existing_id, spec in list(device.entities.items()):
+        if existing_id != object_id and spec.dp_id in device.cover_dp_ids:
+            device.obsolete_discovery_topics.add(discovery_topic(spec))
+            del device.entities[existing_id]
+    if not device.cover_cleanup_done:
+        for dp_id in device.cover_dp_ids:
+            legacy_ids = (
+                ("select", f"x5_{device.uid}_select_{dp_id}"),
+                ("number", f"x5_{device.uid}_number_{dp_id}"),
+                ("text", f"x5_{device.uid}_text_{dp_id}"),
+                ("switch", f"x5_{device.uid}_switch_{dp_id}"),
+                ("sensor", f"x5_{device.uid}_raw_dp_{dp_id}"),
+                ("binary_sensor", f"x5_{device.uid}_raw_dp_{dp_id}"),
+            )
+            device.obsolete_discovery_topics.update(
+                f"homeassistant/{component}/{legacy_id}/config"
+                for component, legacy_id in legacy_ids
+            )
+        device.cover_cleanup_done = True
+    config = {
+        "name": "Cortina",
+        "unique_id": object_id,
+        "command_topic": dp_command_topic(device, control_dp),
+        "state_topic": f"{device.topic_base}/cover/state",
+        "payload_open": "open",
+        "payload_close": "close",
+        "payload_stop": "stop",
+        "state_open": "open",
+        "state_opening": "opening",
+        "state_closed": "closed",
+        "state_closing": "closing",
+        "state_stopped": "stopped",
+        "device_class": "curtain",
+        "availability_topic": AVAILABILITY_TOPIC,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "device": device.ha_device,
+    }
+    if position_state_dp:
+        config["position_topic"] = f"{device.topic_base}/cover/position"
+        config["position_open"] = 100
+        config["position_closed"] = 0
+    if position_control_dp:
+        config["set_position_topic"] = dp_command_topic(device, position_control_dp)
+
+    device.entities[object_id] = EntitySpec(
+        component="cover",
+        object_id=object_id,
+        dp_id=control_dp,
+        kind="cover",
+        config=config,
+    )
+
+
 def add_number_sensor(
     device: BridgeDevice,
     dp_id: str,
@@ -876,7 +976,13 @@ def add_raw_entity(device: BridgeDevice, dp_id: str, value: Any) -> None:
             "entity_category": "diagnostic",
             "device": device.ha_device,
         }
-    device.entities[object_id] = EntitySpec(component=component, object_id=object_id, dp_id=dp_id, kind="raw")
+    device.entities[object_id] = EntitySpec(
+        component=component,
+        object_id=object_id,
+        dp_id=dp_id,
+        kind="raw",
+        config=config,
+    )
 
 
 def has_command_entity(device: BridgeDevice, dp_id: str) -> bool:
@@ -931,6 +1037,57 @@ def apply_known_product_profile(device: BridgeDevice) -> bool:
     return False
 
 
+def apply_cover_profile(device: BridgeDevice) -> bool:
+    descriptor = descriptor_for(device)
+    looks_like_cover = device.category.lower() in {"cl", "clkg"} or any(
+        token in descriptor
+        for token in ("curtain", "cortina", "blind", "shade", "roller shutter")
+    )
+    if not looks_like_cover:
+        return False
+
+    mapping = device.mapping
+    control_dp = dp_for_codes(mapping, {"control", "curtain_control", "mach_operate"})
+    position_control_dp = dp_for_codes(
+        mapping,
+        {"percent_control", "position_control", "position_set", "target_position"},
+    )
+    position_state_dp = dp_for_codes(
+        mapping,
+        {"percent_state", "position", "position_state", "current_position"},
+    )
+    work_state_dp = dp_for_codes(
+        mapping,
+        {"work_state", "curtain_state", "motor_state"},
+    )
+
+    if not control_dp:
+        for dp_id, value in device.last_dps.items():
+            if str(value).lower() in {"open", "close", "stop", "continue"}:
+                control_dp = str(dp_id)
+                break
+    if not position_control_dp and "2" in device.last_dps:
+        position_control_dp = "2"
+    if not position_state_dp and "3" in device.last_dps:
+        position_state_dp = "3"
+    if not work_state_dp:
+        for dp_id, value in device.last_dps.items():
+            if str(value).lower() in {"opening", "closing"}:
+                work_state_dp = str(dp_id)
+                break
+
+    if not control_dp:
+        return False
+    add_cover_entity(
+        device,
+        control_dp,
+        position_control_dp,
+        position_state_dp,
+        work_state_dp,
+    )
+    return True
+
+
 def infer_entities(device: BridgeDevice) -> None:
     add_last_event_entity(device)
     mapping = device.mapping or {}
@@ -942,13 +1099,17 @@ def infer_entities(device: BridgeDevice) -> None:
     )
     looks_like_rain = any(token in descriptor for token in ("rain", "chuva"))
     apply_known_product_profile(device)
+    apply_cover_profile(device)
 
     for dp_id in sorted(mapping.keys(), key=lambda item: int(item) if str(item).isdigit() else str(item)):
+        dp_id = str(dp_id)
         code = mapping_code(mapping, dp_id)
         dp_type = mapping_type(mapping, dp_id)
         values = mapping_values(mapping, dp_id)
         unit = str(values.get("unit") or "")
 
+        if dp_id in device.cover_dp_ids:
+            continue
         if category == "mcs" and code in {"switch", "doorcontact_state", "door_state", "contact"}:
             add_contact_entity(device, dp_id)
         elif code in {"pir", "presence", "motion_state", "motion", "occupancy"}:
@@ -986,6 +1147,9 @@ def infer_entities(device: BridgeDevice) -> None:
 
 def publish_device_discovery(client: mqtt.Client, device: BridgeDevice) -> None:
     infer_entities(device)
+    for topic in device.obsolete_discovery_topics:
+        client.publish(topic, "", qos=1, retain=True)
+    device.obsolete_discovery_topics.clear()
     current_device_payload = device.ha_device
     for spec in device.entities.values():
         spec.config["device"] = current_device_payload
@@ -1136,17 +1300,9 @@ def should_import_cloud_device(meta: dict[str, Any]) -> bool:
     return True
 
 
-def sync_inventory(client: mqtt.Client | None = None) -> None:
-    if not cloud_enabled():
-        if AUTO_SYNC:
-            LOG.warning("Auto sync habilitado, mas credenciais Tuya Cloud estao incompletas")
-        if client:
-            publish_all_discovery(client)
-        return
-
-    LOG.info("Sincronizando inventario com a Tuya Cloud...")
+def import_cloud_inventory(devices: list[dict[str, Any]], client: mqtt.Client | None = None) -> None:
     imported = 0
-    for meta in fetch_cloud_devices():
+    for meta in devices:
         if not should_import_cloud_device(meta):
             continue
         device = REGISTRY.add_or_update(meta)
@@ -1157,6 +1313,54 @@ def sync_inventory(client: mqtt.Client | None = None) -> None:
     LOG.info("Inventario sincronizado: %s subdispositivo(s)", imported)
     if client:
         publish_inventory(client)
+
+
+def sync_inventory(client: mqtt.Client | None = None) -> None:
+    if not cloud_enabled():
+        if AUTO_SYNC:
+            LOG.warning("Auto sync habilitado, mas credenciais Tuya Cloud estao incompletas")
+        if client:
+            publish_all_discovery(client)
+        return
+
+    LOG.info("Sincronizando inventario com a Tuya Cloud...")
+    import_cloud_inventory(fetch_cloud_devices(), client)
+
+
+def start_inventory_sync() -> None:
+    global SYNC_THREAD
+    if not cloud_enabled():
+        return
+    with SYNC_THREAD_LOCK:
+        if SYNC_THREAD and SYNC_THREAD.is_alive():
+            return
+
+        def worker() -> None:
+            try:
+                devices = fetch_cloud_devices()
+                SYNC_RESULT_QUEUE.put((devices, None))
+            except Exception as exc:
+                SYNC_RESULT_QUEUE.put((None, exc))
+
+        LOG.info("Sincronizando inventario com a Tuya Cloud...")
+        SYNC_THREAD = threading.Thread(
+            target=worker,
+            name="x5-cloud-sync",
+            daemon=True,
+        )
+        SYNC_THREAD.start()
+
+
+def process_inventory_sync_results(client: mqtt.Client) -> None:
+    while True:
+        try:
+            devices, error = SYNC_RESULT_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        if error:
+            LOG.error("Falha ao sincronizar inventario: %s", error)
+            continue
+        import_cloud_inventory(devices or [], client)
 
 
 def build_gateway() -> tinytuya.Device:
@@ -1202,15 +1406,64 @@ def publish_entity_state(client: mqtt.Client, device: BridgeDevice, dp_id: str, 
             client.publish(spec.config["state_topic"], json.dumps(value, ensure_ascii=False), qos=1, retain=spec.retain_state)
 
 
+def normalize_cover_state(value: Any) -> str | None:
+    normalized = str(value).strip().lower()
+    return {
+        "open": "opening",
+        "opening": "opening",
+        "close": "closing",
+        "closing": "closing",
+        "stop": "stopped",
+        "stopped": "stopped",
+        "fully_open": "open",
+        "opened": "open",
+        "fully_closed": "closed",
+        "closed": "closed",
+    }.get(normalized)
+
+
+def publish_cover_state(client: mqtt.Client, device: BridgeDevice, dp_id: str, value: Any) -> None:
+    if not device.cover_control_dp:
+        return
+    state_topic = f"{device.topic_base}/cover/state"
+    if dp_id in {device.cover_position_control_dp, device.cover_position_state_dp}:
+        position = normalize_number(value, mapping_scale(device.mapping, dp_id))
+        if position is not None:
+            position = max(0, min(100, position))
+            client.publish(
+                f"{device.topic_base}/cover/position",
+                str(position),
+                qos=1,
+                retain=True,
+            )
+            if position == 0:
+                client.publish(state_topic, "closed", qos=1, retain=True)
+            elif position == 100:
+                client.publish(state_topic, "open", qos=1, retain=True)
+        return
+
+    if dp_id not in {device.cover_control_dp, device.cover_work_state_dp}:
+        return
+    state = normalize_cover_state(value)
+    if state:
+        client.publish(state_topic, state, qos=1, retain=True)
+
+
 def publish_dps(client: mqtt.Client, device: BridgeDevice, dps: dict[str, Any]) -> None:
     if not dps:
         return
     device.last_dps.update(dps)
+    infer_entities(device)
     for dp_id, value in dps.items():
+        dp_id = str(dp_id)
         client.publish(dp_state_topic(device, dp_id), json.dumps(value, ensure_ascii=False), qos=1, retain=True)
-        add_raw_entity(device, dp_id, value)
-        publish_device_discovery(client, device)
+        if dp_id not in device.cover_dp_ids:
+            add_raw_entity(device, dp_id, value)
+    publish_device_discovery(client, device)
+    for dp_id, value in dps.items():
+        dp_id = str(dp_id)
         publish_entity_state(client, device, dp_id, value)
+        publish_cover_state(client, device, dp_id, value)
 
 
 def publish_event(client: mqtt.Client, data: dict[str, Any]) -> None:
@@ -1228,6 +1481,8 @@ def publish_event(client: mqtt.Client, data: dict[str, Any]) -> None:
     else:
         event["source"] = "gateway"
         LOG.debug("Evento do gateway: %s", event)
+        if extract_cid(event):
+            start_inventory_sync()
     client.publish(ALL_EVENTS_TOPIC, json.dumps(event, ensure_ascii=False), qos=0, retain=False)
 
 
@@ -1238,8 +1493,23 @@ def command_spec_for(device: BridgeDevice, dp_id: str) -> EntitySpec | None:
     return None
 
 
-def parse_command_payload(device: BridgeDevice, spec: EntitySpec | None, payload: str) -> Any:
+def parse_command_payload(device: BridgeDevice, spec: EntitySpec | None, dp_id: str, payload: str) -> Any:
     value = payload.strip()
+    if spec and spec.kind == "cover":
+        normalized = value.lower()
+        if normalized not in {"open", "close", "stop", "continue"}:
+            raise ValueError("cortina espera open, close ou stop")
+        return normalized
+
+    if dp_id == device.cover_position_control_dp:
+        try:
+            position = float(value)
+        except ValueError as exc:
+            raise ValueError("posicao da cortina deve ser numerica") from exc
+        if not 0 <= position <= 100:
+            raise ValueError("posicao da cortina deve estar entre 0 e 100")
+        return int(position) if position.is_integer() else position
+
     if spec and spec.kind == "switch":
         if value.upper() == "ON":
             return True
@@ -1294,27 +1564,47 @@ def handle_command(client: mqtt.Client, topic: str, payload: str) -> None:
         return
     spec = command_spec_for(device, dp_id)
     try:
-        new_value = parse_command_payload(device, spec, payload)
+        new_value = parse_command_payload(device, spec, dp_id, payload)
     except Exception as exc:
         LOG.warning("Comando invalido para %s DP %s: %s", device.name, dp_id, exc)
         return
-    try:
-        with OP_LOCK:
-            result = device.local.set_value(dp_id, new_value, nowait=False)
-        device.last_dps[dp_id] = new_value
-        client.publish(dp_state_topic(device, dp_id), json.dumps(new_value, ensure_ascii=False), qos=1, retain=True)
-        publish_entity_state(client, device, dp_id, new_value)
-        LOG.info("Comando enviado para %s DP %s = %r: %s", device.name, dp_id, new_value, json_safe(result))
-    except Exception:
-        LOG.exception("Falha ao enviar comando para %s DP %s", device.name, dp_id)
+    COMMAND_QUEUE.put((device.uid, dp_id, new_value))
+    LOG.debug("Comando enfileirado para %s DP %s = %r", device.name, dp_id, new_value)
+
+
+def process_pending_commands(client: mqtt.Client, limit: int = 1) -> None:
+    for _ in range(limit):
+        try:
+            uid, dp_id, new_value = COMMAND_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        device = next((item for item in REGISTRY.by_id.values() if item.uid == uid), None)
+        if not device or not device.local:
+            LOG.warning("Comando descartado; dispositivo %s nao esta conectado", uid)
+            continue
+        try:
+            result = device.local.set_value(dp_id, new_value, nowait=True)
+            if isinstance(result, dict) and result.get("Error"):
+                raise RuntimeError(str(result.get("Error")))
+            device.last_dps[dp_id] = new_value
+            client.publish(
+                dp_state_topic(device, dp_id),
+                json.dumps(new_value, ensure_ascii=False),
+                qos=1,
+                retain=True,
+            )
+            publish_entity_state(client, device, dp_id, new_value)
+            publish_cover_state(client, device, dp_id, new_value)
+            LOG.info("Comando enviado para %s DP %s = %r", device.name, dp_id, new_value)
+        except Exception:
+            LOG.exception("Falha ao enviar comando para %s DP %s", device.name, dp_id)
 
 
 def query_initial_status(client: mqtt.Client, device: BridgeDevice) -> None:
     if not device.local:
         return
     try:
-        with OP_LOCK:
-            initial = device.local.status()
+        initial = device.local.status()
         LOG.info("Status inicial de %s: %s", device.name, json_safe(initial))
         publish_dps(client, device, extract_dps(initial))
     except Exception as exc:
@@ -1322,7 +1612,7 @@ def query_initial_status(client: mqtt.Client, device: BridgeDevice) -> None:
 
 
 def listen_forever(client: mqtt.Client) -> None:
-    next_sync = 0.0
+    next_sync = time.monotonic() + (SYNC_INTERVAL_MINUTES * 60)
     while not STOP:
         gateway = None
         try:
@@ -1330,23 +1620,21 @@ def listen_forever(client: mqtt.Client) -> None:
             publish_all_discovery(client)
             for device in REGISTRY.all():
                 query_initial_status(client, device)
+            gateway.set_socketTimeout(LISTEN_POLL_SECONDS)
             publish_availability(client, "online", force=True)
             heartbeat_at = 0.0
             while not STOP:
+                process_pending_commands(client)
+                process_inventory_sync_results(client)
                 current = time.monotonic()
                 if current >= next_sync:
-                    try:
-                        sync_inventory(client)
-                    except Exception:
-                        LOG.exception("Falha ao sincronizar inventario")
+                    start_inventory_sync()
                     next_sync = current + (SYNC_INTERVAL_MINUTES * 60)
                 if current >= heartbeat_at:
-                    with OP_LOCK:
-                        gateway.send(gateway.generate_payload(tinytuya.HEART_BEAT))
+                    gateway.send(gateway.generate_payload(tinytuya.HEART_BEAT))
                     publish_availability(client, "online")
                     heartbeat_at = current + 9.0
-                with OP_LOCK:
-                    data = gateway.receive()
+                data = gateway.receive()
                 if isinstance(data, dict):
                     publish_event(client, data)
         except (OSError, socket.error, ValueError, KeyError) as exc:

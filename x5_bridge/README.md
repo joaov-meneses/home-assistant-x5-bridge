@@ -1,6 +1,14 @@
-# X5 Bridge 0.6.2
+# X5 Bridge 0.7.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
+
+## Cortinas
+
+Dispositivos Tuya das categorias de cortina são publicados como uma entidade
+`cover` nativa do Home Assistant. O bridge usa preferencialmente os códigos da
+especificação Tuya (`control`, `percent_control`, `percent_state` e
+`work_state`) e mantém uma detecção por estados locais para firmwares OEM que
+não fornecem o mapeamento completo.
 
 ## Auto sync
 

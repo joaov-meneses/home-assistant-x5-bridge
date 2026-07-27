@@ -28,7 +28,7 @@ for old_key in door_device_id door_node_id door_contact_dp; do
   fi
 done
 
-bashio::log.info "Iniciando X5 Bridge 0.6.2..."
+bashio::log.info "Iniciando X5 Bridge 0.7.0..."
 bashio::log.info "Gateway: ${X5_IP} | protocolo ${X5_VERSION}"
 if bashio::config.true 'auto_sync'; then
   bashio::log.info "Sincronizacao automatica ativa | regiao ${TUYA_REGION} | intervalo ${SYNC_INTERVAL_MINUTES} min"
