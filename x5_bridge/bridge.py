@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 
 def env(name: str, default: str = "") -> str:
@@ -62,6 +62,8 @@ LAST_AVAILABILITY_STATE = ""
 LAST_AVAILABILITY_AT = 0.0
 AVAILABILITY_REFRESH_SECONDS = 30.0
 LISTEN_POLL_SECONDS = 0.25
+HEARTBEAT_INTERVAL_SECONDS = 5.0
+HEARTBEAT_TIMEOUT_SECONDS = 1.0
 
 AVAILABILITY_LOCK = threading.Lock()
 COMMAND_QUEUE: queue.Queue[tuple[str, str, Any]] = queue.Queue()
@@ -122,6 +124,18 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [json_safe(item) for item in value]
     return repr(value)
+
+
+def tuya_error_message(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    error = value.get("Error")
+    code = value.get("Err")
+    if error:
+        return f"{error} (codigo {code})" if code not in (None, "", 0, "0") else str(error)
+    if code not in (None, "", 0, "0"):
+        return f"Erro Tuya {code}"
+    return ""
 
 
 def extract_dps(message: Any) -> dict[str, Any]:
@@ -1373,9 +1387,9 @@ def build_gateway() -> tinytuya.Device:
         version=X5_VERSION,
     )
     gateway.set_socketPersistent(True)
-    gateway.set_socketTimeout(10)
-    gateway.set_socketRetryLimit(2)
-    gateway.set_socketRetryDelay(2)
+    gateway.set_socketTimeout(HEARTBEAT_TIMEOUT_SECONDS)
+    gateway.set_socketRetryLimit(1)
+    gateway.set_socketRetryDelay(0.25)
     REGISTRY.attach_gateway(gateway)
     return gateway
 
@@ -1486,6 +1500,20 @@ def publish_event(client: mqtt.Client, data: dict[str, Any]) -> None:
     client.publish(ALL_EVENTS_TOPIC, json.dumps(event, ensure_ascii=False), qos=0, retain=False)
 
 
+def confirm_gateway_online(client: mqtt.Client, gateway: tinytuya.Device) -> None:
+    gateway.set_socketTimeout(HEARTBEAT_TIMEOUT_SECONDS)
+    try:
+        result = gateway.heartbeat(nowait=False)
+    finally:
+        gateway.set_socketTimeout(LISTEN_POLL_SECONDS)
+    error = tuya_error_message(result)
+    if error:
+        raise ConnectionError(f"heartbeat do X5 falhou: {error}")
+    publish_availability(client, "online")
+    if isinstance(result, dict) and (extract_cid(result) or extract_dps(result)):
+        publish_event(client, result)
+
+
 def command_spec_for(device: BridgeDevice, dp_id: str) -> EntitySpec | None:
     for spec in device.entities.values():
         if spec.dp_id == dp_id and spec.config.get("command_topic"):
@@ -1584,8 +1612,9 @@ def process_pending_commands(client: mqtt.Client, limit: int = 1) -> None:
             continue
         try:
             result = device.local.set_value(dp_id, new_value, nowait=True)
-            if isinstance(result, dict) and result.get("Error"):
-                raise RuntimeError(str(result.get("Error")))
+            error = tuya_error_message(result)
+            if error:
+                raise ConnectionError(error)
             device.last_dps[dp_id] = new_value
             client.publish(
                 dp_state_topic(device, dp_id),
@@ -1600,15 +1629,21 @@ def process_pending_commands(client: mqtt.Client, limit: int = 1) -> None:
             LOG.exception("Falha ao enviar comando para %s DP %s", device.name, dp_id)
 
 
-def query_initial_status(client: mqtt.Client, device: BridgeDevice) -> None:
+def query_initial_status(client: mqtt.Client, device: BridgeDevice) -> bool:
     if not device.local:
-        return
+        return False
     try:
         initial = device.local.status()
+        error = tuya_error_message(initial)
+        if error:
+            LOG.warning("Consulta inicial de %s falhou: %s", device.name, error)
+            return False
         LOG.info("Status inicial de %s: %s", device.name, json_safe(initial))
         publish_dps(client, device, extract_dps(initial))
+        return True
     except Exception as exc:
         LOG.warning("Consulta inicial de %s nao respondeu; continuarei escutando: %s", device.name, exc)
+        return False
 
 
 def listen_forever(client: mqtt.Client) -> None:
@@ -1618,11 +1653,12 @@ def listen_forever(client: mqtt.Client) -> None:
         try:
             gateway = build_gateway()
             publish_all_discovery(client)
+            confirm_gateway_online(client, gateway)
+            gateway.set_socketTimeout(2.0)
             for device in REGISTRY.all():
                 query_initial_status(client, device)
             gateway.set_socketTimeout(LISTEN_POLL_SECONDS)
-            publish_availability(client, "online", force=True)
-            heartbeat_at = 0.0
+            heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
             while not STOP:
                 process_pending_commands(client)
                 process_inventory_sync_results(client)
@@ -1631,13 +1667,15 @@ def listen_forever(client: mqtt.Client) -> None:
                     start_inventory_sync()
                     next_sync = current + (SYNC_INTERVAL_MINUTES * 60)
                 if current >= heartbeat_at:
-                    gateway.send(gateway.generate_payload(tinytuya.HEART_BEAT))
-                    publish_availability(client, "online")
-                    heartbeat_at = current + 9.0
+                    confirm_gateway_online(client, gateway)
+                    heartbeat_at = current + HEARTBEAT_INTERVAL_SECONDS
                 data = gateway.receive()
                 if isinstance(data, dict):
+                    error = tuya_error_message(data)
+                    if error:
+                        raise ConnectionError(error)
                     publish_event(client, data)
-        except (OSError, socket.error, ValueError, KeyError) as exc:
+        except (OSError, socket.error, ValueError, KeyError, ConnectionError) as exc:
             LOG.warning("Conexao com o X5 interrompida: %s", exc)
         except Exception:
             LOG.exception("Erro inesperado no bridge")

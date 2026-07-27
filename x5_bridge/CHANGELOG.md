@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+- Só publica o gateway como `online` depois de receber uma resposta real do X5.
+- Valida respostas de erro retornadas pelo TinyTuya no heartbeat e na escuta.
+- Executa heartbeat confirmado a cada 5 segundos, com timeout de 1 segundo.
+- Publica `offline` e reinicia a conexão quando o X5 deixa de responder.
+- Evita publicar como estado inicial os objetos de erro `901`, `902` e similares.
+
 ## 0.7.0
 
 - Corrige a falha de MQTT Discovery ao receber um DP desconhecido.

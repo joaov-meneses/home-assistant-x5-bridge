@@ -28,6 +28,20 @@ class FakeLocalDevice:
         return None
 
 
+class FakeGateway:
+    def __init__(self, heartbeat_result) -> None:
+        self.heartbeat_result = heartbeat_result
+        self.timeouts = []
+        self.heartbeat_calls = []
+
+    def set_socketTimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def heartbeat(self, nowait=True):
+        self.heartbeat_calls.append(nowait)
+        return self.heartbeat_result
+
+
 def curtain_mapping():
     return {
         "1": {
@@ -202,6 +216,67 @@ class CommandQueueTests(unittest.TestCase):
         self.assertEqual(value, 35)
         with self.assertRaises(ValueError):
             bridge.parse_command_payload(device, None, "2", "101")
+
+
+class AvailabilityTests(unittest.TestCase):
+    def setUp(self):
+        bridge.GATEWAY_ONLINE = False
+        bridge.LAST_AVAILABILITY_STATE = ""
+        bridge.LAST_AVAILABILITY_AT = 0.0
+
+    def test_tuya_network_error_is_recognized(self):
+        message = bridge.tuya_error_message(
+            {
+                "Error": "Network Error: Unable to Connect",
+                "Err": "901",
+                "Payload": None,
+            }
+        )
+
+        self.assertIn("Unable to Connect", message)
+        self.assertIn("901", message)
+
+    def test_heartbeat_error_does_not_publish_online(self):
+        client = FakeMqttClient()
+        gateway = FakeGateway(
+            {
+                "Error": "Network Error: Unable to Connect",
+                "Err": "901",
+                "Payload": None,
+            }
+        )
+
+        with self.assertRaises(ConnectionError):
+            bridge.confirm_gateway_online(client, gateway)
+
+        self.assertFalse(bridge.GATEWAY_ONLINE)
+        self.assertFalse(
+            any(
+                item["topic"] == bridge.AVAILABILITY_TOPIC
+                and item["payload"] == "online"
+                for item in client.messages
+            )
+        )
+        self.assertEqual(gateway.heartbeat_calls, [False])
+
+    def test_confirmed_heartbeat_publishes_online(self):
+        client = FakeMqttClient()
+        gateway = FakeGateway(None)
+
+        bridge.confirm_gateway_online(client, gateway)
+
+        self.assertTrue(bridge.GATEWAY_ONLINE)
+        self.assertEqual(
+            gateway.timeouts,
+            [bridge.HEARTBEAT_TIMEOUT_SECONDS, bridge.LISTEN_POLL_SECONDS],
+        )
+        self.assertTrue(
+            any(
+                item["topic"] == bridge.AVAILABILITY_TOPIC
+                and item["payload"] == "online"
+                for item in client.messages
+            )
+        )
 
 
 if __name__ == "__main__":
