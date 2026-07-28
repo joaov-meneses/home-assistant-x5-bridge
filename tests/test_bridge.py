@@ -223,6 +223,12 @@ class AvailabilityTests(unittest.TestCase):
         bridge.GATEWAY_ONLINE = False
         bridge.LAST_AVAILABILITY_STATE = ""
         bridge.LAST_AVAILABILITY_AT = 0.0
+        bridge.REGISTRY.by_id.clear()
+        bridge.REGISTRY.by_cid.clear()
+
+    def tearDown(self):
+        bridge.REGISTRY.by_id.clear()
+        bridge.REGISTRY.by_cid.clear()
 
     def test_tuya_network_error_is_recognized(self):
         message = bridge.tuya_error_message(
@@ -258,6 +264,68 @@ class AvailabilityTests(unittest.TestCase):
             )
         )
         self.assertEqual(gateway.heartbeat_calls, [False])
+
+    def test_subdevice_status_is_published_by_zigbee_eui(self):
+        client = FakeMqttClient()
+        online_device = bridge.BridgeDevice(
+            id="online-device",
+            node_id="00124b0000000001",
+            name="Online",
+        )
+        offline_device = bridge.BridgeDevice(
+            id="offline-device",
+            node_id="00124b0000000002",
+            name="Offline",
+        )
+        bridge.REGISTRY.by_id = {
+            online_device.id: online_device,
+            offline_device.id: offline_device,
+        }
+        bridge.REGISTRY.by_cid = {
+            online_device.node_id: online_device,
+            offline_device.node_id: offline_device,
+        }
+
+        applied = bridge.apply_subdevice_status(
+            client,
+            {
+                "reqType": "subdev_online_stat_report",
+                "data": {
+                    "online": [online_device.node_id],
+                    "offline": [offline_device.node_id],
+                },
+            },
+        )
+
+        self.assertTrue(applied)
+        self.assertTrue(online_device.online)
+        self.assertFalse(offline_device.online)
+        states = {(item["topic"], item["payload"]) for item in client.messages}
+        self.assertIn(("x5/devices/online_device/availability", "online"), states)
+        self.assertIn(("x5/devices/offline_device/availability", "offline"), states)
+
+    def test_device_entities_require_gateway_and_zigbee_availability(self):
+        client = FakeMqttClient()
+        device = bridge.BridgeDevice(
+            id="contact-device",
+            node_id="00124b0000000003",
+            name="Contato",
+        )
+        bridge.add_contact_entity(device, "1")
+
+        bridge.publish_device_discovery(client, device)
+
+        spec = device.entities["x5_contact_device_contact_1"]
+        self.assertEqual(spec.config["availability_mode"], "all")
+        self.assertEqual(
+            [item["topic"] for item in spec.config["availability"]],
+            [bridge.AVAILABILITY_TOPIC, device.availability_topic],
+        )
+        connectivity = device.entities["x5_contact_device_connection"]
+        self.assertEqual(
+            connectivity.config["state_topic"],
+            device.availability_topic,
+        )
 
     def test_confirmed_heartbeat_publishes_online(self):
         client = FakeMqttClient()
