@@ -1,6 +1,11 @@
-# X5 Bridge 0.7.1
+# X5 Bridge 0.8.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
+
+O bridge consulta localmente a tabela de disponibilidade Zigbee do X5 a cada
+30 segundos. Cada subdispositivo recebe uma entidade diagnóstica
+`Conexão Zigbee`, e suas demais entidades ficam indisponíveis no Home Assistant
+quando o X5 o reporta como offline.
 
 ## Cortinas
 

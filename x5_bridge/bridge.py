@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -64,6 +64,8 @@ AVAILABILITY_REFRESH_SECONDS = 30.0
 LISTEN_POLL_SECONDS = 0.25
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 HEARTBEAT_TIMEOUT_SECONDS = 1.0
+SUBDEVICE_STATUS_INTERVAL_SECONDS = 30.0
+SUBDEVICE_STATUS_TIMEOUT_SECONDS = 2.0
 
 AVAILABILITY_LOCK = threading.Lock()
 COMMAND_QUEUE: queue.Queue[tuple[str, str, Any]] = queue.Queue()
@@ -428,6 +430,7 @@ class BridgeDevice:
     model: str = ""
     mapping: dict[str, Any] = field(default_factory=dict)
     local: tinytuya.Device | None = None
+    online: bool | None = None
     last_dps: dict[str, Any] = field(default_factory=dict)
     discovered_raw_dps: set[str] = field(default_factory=set)
     entities: dict[str, EntitySpec] = field(default_factory=dict)
@@ -449,6 +452,10 @@ class BridgeDevice:
     @property
     def topic_base(self) -> str:
         return f"{TOPIC_PREFIX}/devices/{self.uid}"
+
+    @property
+    def availability_topic(self) -> str:
+        return f"{self.topic_base}/availability"
 
     @property
     def cover_dp_ids(self) -> set[str]:
@@ -635,6 +642,28 @@ def add_last_event_entity(device: BridgeDevice) -> None:
             "value_template": "{{ value_json.received_at }}",
             "json_attributes_topic": f"{device.topic_base}/event",
             "device_class": "timestamp",
+            "availability_topic": AVAILABILITY_TOPIC,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "entity_category": "diagnostic",
+            "device": device.ha_device,
+        },
+    )
+
+
+def add_connectivity_entity(device: BridgeDevice) -> None:
+    object_id = f"x5_{device.uid}_connection"
+    device.entities[object_id] = EntitySpec(
+        component="binary_sensor",
+        object_id=object_id,
+        kind="connectivity",
+        config={
+            "name": "Conexão Zigbee",
+            "unique_id": object_id,
+            "state_topic": device.availability_topic,
+            "payload_on": "online",
+            "payload_off": "offline",
+            "device_class": "connectivity",
             "availability_topic": AVAILABILITY_TOPIC,
             "payload_available": "online",
             "payload_not_available": "offline",
@@ -1104,6 +1133,7 @@ def apply_cover_profile(device: BridgeDevice) -> bool:
 
 def infer_entities(device: BridgeDevice) -> None:
     add_last_event_entity(device)
+    add_connectivity_entity(device)
     mapping = device.mapping or {}
     category = device.category.lower()
     descriptor = descriptor_for(device)
@@ -1167,6 +1197,23 @@ def publish_device_discovery(client: mqtt.Client, device: BridgeDevice) -> None:
     current_device_payload = device.ha_device
     for spec in device.entities.values():
         spec.config["device"] = current_device_payload
+        if spec.kind != "connectivity":
+            spec.config.pop("availability_topic", None)
+            spec.config.pop("payload_available", None)
+            spec.config.pop("payload_not_available", None)
+            spec.config["availability"] = [
+                {
+                    "topic": AVAILABILITY_TOPIC,
+                    "payload_available": "online",
+                    "payload_not_available": "offline",
+                },
+                {
+                    "topic": device.availability_topic,
+                    "payload_available": "online",
+                    "payload_not_available": "offline",
+                },
+            ]
+            spec.config["availability_mode"] = "all"
         publish_config(client, spec)
 
 
@@ -1218,6 +1265,14 @@ def mqtt_client() -> mqtt.Client:
             return
         LOG.info("Conectado ao MQTT em %s:%s", MQTT_HOST, MQTT_PORT)
         publish_all_discovery(client_obj)
+        for device in REGISTRY.all():
+            if device.online is not None:
+                publish_device_availability(
+                    client_obj,
+                    device,
+                    device.online,
+                    force=True,
+                )
         refresh_availability(client_obj)
         client_obj.subscribe(f"{TOPIC_PREFIX}/devices/+/set/+")
 
@@ -1486,6 +1541,7 @@ def publish_event(client: mqtt.Client, data: dict[str, Any]) -> None:
     event = json_safe(data)
     event["received_at"] = now_iso()
     if device:
+        publish_device_availability(client, device, True)
         event["source"] = device.slug
         event["device_id"] = device.id
         event["node_id"] = device.node_id
@@ -1512,6 +1568,60 @@ def confirm_gateway_online(client: mqtt.Client, gateway: tinytuya.Device) -> Non
     publish_availability(client, "online")
     if isinstance(result, dict) and (extract_cid(result) or extract_dps(result)):
         publish_event(client, result)
+
+
+def publish_device_availability(
+    client: mqtt.Client,
+    device: BridgeDevice,
+    online: bool,
+    force: bool = False,
+) -> None:
+    if not force and device.online is online:
+        return
+    device.online = online
+    client.publish(
+        device.availability_topic,
+        "online" if online else "offline",
+        qos=1,
+        retain=True,
+    )
+
+
+def apply_subdevice_status(client: mqtt.Client, response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return False
+    online = {str(item) for item in data.get("online", [])}
+    offline = {str(item) for item in data.get("offline", [])}
+    if not online and not offline:
+        return False
+    for device in REGISTRY.all():
+        if device.node_id in online:
+            publish_device_availability(client, device, True, force=True)
+        elif device.node_id in offline:
+            publish_device_availability(client, device, False, force=True)
+    return True
+
+
+def query_subdevice_status(
+    client: mqtt.Client,
+    gateway: tinytuya.Device,
+) -> bool:
+    gateway.set_socketTimeout(SUBDEVICE_STATUS_TIMEOUT_SECONDS)
+    try:
+        response = gateway.subdev_query()
+    finally:
+        gateway.set_socketTimeout(LISTEN_POLL_SECONDS)
+    error = tuya_error_message(response)
+    if error:
+        raise ConnectionError(f"consulta de disponibilidade Zigbee falhou: {error}")
+    if not apply_subdevice_status(client, response):
+        LOG.warning("Resposta de disponibilidade Zigbee inesperada: %s", json_safe(response))
+        return False
+    LOG.debug("Disponibilidade Zigbee atualizada: %s", json_safe(response))
+    return True
 
 
 def command_spec_for(device: BridgeDevice, dp_id: str) -> EntitySpec | None:
@@ -1657,8 +1767,10 @@ def listen_forever(client: mqtt.Client) -> None:
             gateway.set_socketTimeout(2.0)
             for device in REGISTRY.all():
                 query_initial_status(client, device)
+            query_subdevice_status(client, gateway)
             gateway.set_socketTimeout(LISTEN_POLL_SECONDS)
             heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
+            subdevice_status_at = time.monotonic() + SUBDEVICE_STATUS_INTERVAL_SECONDS
             while not STOP:
                 process_pending_commands(client)
                 process_inventory_sync_results(client)
@@ -1669,6 +1781,9 @@ def listen_forever(client: mqtt.Client) -> None:
                 if current >= heartbeat_at:
                     confirm_gateway_online(client, gateway)
                     heartbeat_at = current + HEARTBEAT_INTERVAL_SECONDS
+                if current >= subdevice_status_at:
+                    query_subdevice_status(client, gateway)
+                    subdevice_status_at = current + SUBDEVICE_STATUS_INTERVAL_SECONDS
                 data = gateway.receive()
                 if isinstance(data, dict):
                     error = tuya_error_message(data)

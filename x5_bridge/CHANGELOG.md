@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0
+
+- Consulta localmente o X5 com `subdev_online_stat_query` a cada 30 segundos.
+- Publica disponibilidade MQTT independente para cada subdispositivo Zigbee.
+- Cria o sensor diagnóstico `Conexão Zigbee` em cada dispositivo.
+- Exige disponibilidade simultânea do gateway e do subdispositivo nas entidades.
+- Restaura imediatamente o estado online quando chega um evento real do dispositivo.
+
 ## 0.7.1
 
 - Só publica o gateway como `online` depois de receber uma resposta real do X5.
