@@ -77,6 +77,21 @@ def curtain_mapping():
     }
 
 
+def yale_lia_mapping():
+    return {
+        "1": {"code": "unlock_fingerprint", "type": "integer"},
+        "2": {"code": "unlock_password", "type": "integer"},
+        "5": {"code": "unlock_card", "type": "integer"},
+        "7": {"code": "unlock_key", "type": "integer"},
+        "10": {
+            "code": "residual_electricity",
+            "type": "integer",
+            "values": {"min": 0, "max": 100, "step": 1, "scale": 0, "unit": "%"},
+        },
+        "41": {"code": "unlock_remote", "type": "integer"},
+    }
+
+
 class EntityDiscoveryTests(unittest.TestCase):
     def test_raw_entity_keeps_its_discovery_config(self):
         device = bridge.BridgeDevice(
@@ -157,6 +172,105 @@ class EntityDiscoveryTests(unittest.TestCase):
         self.assertIn(("x5/devices/curtain_device/cover/position", "75"), states)
         self.assertIn(("x5/devices/curtain_device/cover/state", "opening"), states)
 
+    def test_yale_lia_profile_creates_native_lock_and_diagnostics(self):
+        device = bridge.BridgeDevice(
+            id="yale-device",
+            node_id="00158d0000000001",
+            name="Fechadura Porta da Frente",
+            category="ms",
+            product_name="Yale Door Lock",
+            product_id="avdayhvk",
+            mapping=yale_lia_mapping(),
+        )
+
+        bridge.infer_entities(device)
+
+        lock = device.entities["x5_yale_device_lock_101"]
+        self.assertEqual(lock.component, "lock")
+        self.assertEqual(lock.config["command_topic"], "x5/devices/yale_device/set/101")
+        self.assertEqual(lock.config["payload_lock"], "false")
+        self.assertEqual(lock.config["payload_unlock"], "true")
+        self.assertEqual(device.ha_device["manufacturer"], "Yale")
+        self.assertEqual(device.ha_device["model"], "LIA")
+        self.assertIn("x5_yale_device_battery_10", device.entities)
+        self.assertIn("x5_yale_device_unlock_password_2", device.entities)
+        self.assertIn("x5_yale_device_lock_alarm_9", device.entities)
+        self.assertEqual(
+            device.suppressed_raw_dps,
+            {"1", "2", "5", "7", "9", "10", "41", "101"},
+        )
+        for dp_id in device.suppressed_raw_dps:
+            self.assertIn(
+                f"homeassistant/sensor/x5_yale_device_raw_dp_{dp_id}/config",
+                device.obsolete_discovery_topics,
+            )
+            self.assertIn(
+                f"homeassistant/binary_sensor/x5_yale_device_raw_dp_{dp_id}/config",
+                device.obsolete_discovery_topics,
+            )
+
+    def test_yale_lia_profile_does_not_recreate_suppressed_raw_dps(self):
+        client = FakeMqttClient()
+        device = bridge.BridgeDevice(
+            id="yale-device",
+            node_id="00158d0000000001",
+            name="Fechadura Porta da Frente",
+            category="ms",
+            product_name="Yale Door Lock",
+            product_id="avdayhvk",
+            mapping=yale_lia_mapping(),
+        )
+
+        bridge.publish_dps(
+            client,
+            device,
+            {
+                "2": 0,
+                "7": 0,
+                "9": "Master_Code_Change",
+                "10": 79,
+                "41": 0,
+                "101": False,
+            },
+        )
+
+        self.assertFalse(any(spec.kind == "raw" for spec in device.entities.values()))
+        discovery_messages = {
+            (item["topic"], item["payload"])
+            for item in client.messages
+            if item["topic"].endswith("/config")
+        }
+        for dp_id in {"2", "7", "9", "10", "41", "101"}:
+            self.assertIn(
+                (
+                    f"homeassistant/sensor/x5_yale_device_raw_dp_{dp_id}/config",
+                    "",
+                ),
+                discovery_messages,
+            )
+
+    def test_yale_lia_lock_state_uses_dp_101_boolean(self):
+        client = FakeMqttClient()
+        device = bridge.BridgeDevice(
+            id="yale-device",
+            node_id="00158d0000000001",
+            name="Yale Door Lock",
+            category="ms",
+            product_id="avdayhvk",
+            mapping=yale_lia_mapping(),
+        )
+        bridge.infer_entities(device)
+
+        bridge.publish_entity_state(client, device, "101", True)
+        bridge.publish_entity_state(client, device, "101", False)
+
+        states = [
+            item["payload"]
+            for item in client.messages
+            if item["topic"] == "x5/devices/yale_device/lock/101"
+        ]
+        self.assertEqual(states, ["UNLOCKED", "LOCKED"])
+
 
 class CommandQueueTests(unittest.TestCase):
     def setUp(self):
@@ -216,6 +330,31 @@ class CommandQueueTests(unittest.TestCase):
         self.assertEqual(value, 35)
         with self.assertRaises(ValueError):
             bridge.parse_command_payload(device, None, "2", "101")
+
+    def test_yale_lia_lock_command_is_sent_as_boolean(self):
+        client = FakeMqttClient()
+        local = FakeLocalDevice()
+        device = bridge.BridgeDevice(
+            id="yale-device",
+            node_id="00158d0000000001",
+            name="Yale Door Lock",
+            category="ms",
+            product_id="avdayhvk",
+            mapping=yale_lia_mapping(),
+            local=local,
+        )
+        bridge.REGISTRY.by_id[device.id] = device
+        bridge.REGISTRY.by_cid[device.node_id] = device
+        bridge.infer_entities(device)
+
+        bridge.handle_command(client, "x5/devices/yale_device/set/101", "false")
+        bridge.process_pending_commands(client)
+
+        self.assertEqual(local.calls, [("101", False, True)])
+        self.assertIn(
+            ("x5/devices/yale_device/lock/101", "LOCKED"),
+            {(item["topic"], item["payload"]) for item in client.messages},
+        )
 
 
 class AvailabilityTests(unittest.TestCase):
