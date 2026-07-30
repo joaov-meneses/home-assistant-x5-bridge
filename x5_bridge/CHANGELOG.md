@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Substitui os valores numéricos de último acesso da Yale LIA por timestamps do
+  histórico oficial da Tuya Cloud.
+- Atualiza os sensores de acesso imediatamente pelos eventos locais do X5 e
+  recupera o histórico novamente em cada sincronização periódica.
+- Mantém método, origem e identificador da credencial como atributos dos
+  sensores.
+
 ## 0.8.2
 
 - Aguarda o Supervisor registrar o servico MQTT antes de iniciar o bridge.

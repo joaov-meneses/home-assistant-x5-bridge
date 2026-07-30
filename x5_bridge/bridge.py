@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.8.2"
+VERSION = "0.9.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -66,6 +66,27 @@ HEARTBEAT_INTERVAL_SECONDS = 5.0
 HEARTBEAT_TIMEOUT_SECONDS = 1.0
 SUBDEVICE_STATUS_INTERVAL_SECONDS = 30.0
 SUBDEVICE_STATUS_TIMEOUT_SECONDS = 2.0
+LOCK_HISTORY_LOOKBACK_SECONDS = 30 * 24 * 60 * 60
+LOCK_HISTORY_PAGE_SIZE = 100
+
+LOCK_ACCESS_DPS: dict[str, tuple[str, str, str]] = {
+    "1": ("unlock_fingerprint", "unlock_fingerprint", "Último acesso por biometria"),
+    "2": ("unlock_password", "unlock_password", "Último acesso por senha"),
+    "5": ("unlock_card", "unlock_card", "Último acesso por cartão"),
+    "7": ("unlock_key", "unlock_key", "Último acesso por chave"),
+    "41": ("unlock_remote", "unlock_remote", "Último acesso remoto"),
+}
+LOCK_ACCESS_CODES = {
+    code: (dp_id, suffix, name)
+    for dp_id, (code, suffix, name) in LOCK_ACCESS_DPS.items()
+}
+LOCK_ACCESS_METHOD_NAMES = {
+    "unlock_fingerprint": "Biometria",
+    "unlock_password": "Senha",
+    "unlock_card": "Cartão",
+    "unlock_key": "Chave",
+    "unlock_remote": "Remoto",
+}
 
 AVAILABILITY_LOCK = threading.Lock()
 COMMAND_QUEUE: queue.Queue[tuple[str, str, Any]] = queue.Queue()
@@ -408,6 +429,26 @@ def descriptor_for(device: "BridgeDevice") -> str:
     )
 
 
+def is_yale_lia(device: "BridgeDevice") -> bool:
+    return device.product_id == "avdayhvk" or (
+        device.category.lower() == "ms"
+        and "yale door lock" in descriptor_for(device)
+    )
+
+
+def is_yale_lia_meta(meta: dict[str, Any]) -> bool:
+    product_id = clean_text(meta.get("product_id"))
+    category = clean_text(meta.get("category")).lower()
+    descriptor = " ".join(
+        clean_text(meta.get(key)).lower()
+        for key in ("custom_name", "name", "product_name", "model", "category", "product_id")
+        if clean_text(meta.get(key))
+    )
+    return product_id == "avdayhvk" or (
+        category == "ms" and "yale door lock" in descriptor
+    )
+
+
 @dataclass
 class EntitySpec:
     component: str
@@ -442,6 +483,7 @@ class BridgeDevice:
     cover_position_control_dp: str = ""
     cover_position_state_dp: str = ""
     cover_work_state_dp: str = ""
+    lock_access_history: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def uid(self) -> str:
@@ -474,15 +516,11 @@ class BridgeDevice:
 
     @property
     def ha_device(self) -> dict[str, Any]:
-        is_yale_lia = self.product_id == "avdayhvk" or (
-            self.category.lower() == "ms"
-            and "yale door lock" in descriptor_for(self)
-        )
         return {
             "identifiers": [f"x5_{self.uid}"],
             "name": self.name or self.product_name or self.id,
-            "manufacturer": "Yale" if is_yale_lia else "Tuya/OEM",
-            "model": "LIA" if is_yale_lia else self.model or self.product_name or self.category or "Subdevice",
+            "manufacturer": "Yale" if is_yale_lia(self) else "Tuya/OEM",
+            "model": "LIA" if is_yale_lia(self) else self.model or self.product_name or self.category or "Subdevice",
             "via_device": "x5_bridge",
         }
 
@@ -531,6 +569,9 @@ class Registry:
         mapping = meta.get("mapping")
         if isinstance(mapping, dict):
             device.mapping = mapping
+        history = meta.get("_lock_access_history")
+        if isinstance(history, dict):
+            merge_lock_access_history(device, history)
         if self.gateway and device.local is None:
             device.local = tinytuya.Device(dev_id=device.id, cid=device.node_id, parent=self.gateway)
         if previous_name and previous_name != device.name:
@@ -634,6 +675,39 @@ def dp_state_topic(device: BridgeDevice, dp_id: str) -> str:
 
 def dp_command_topic(device: BridgeDevice, dp_id: str) -> str:
     return f"{device.topic_base}/set/{dp_id}"
+
+
+def lock_access_topic(device: BridgeDevice, method_code: str) -> str:
+    details = LOCK_ACCESS_CODES.get(method_code)
+    suffix = details[1] if details else slugify(method_code)
+    return f"{device.topic_base}/access/{suffix}"
+
+
+def add_lock_access_sensor(
+    device: BridgeDevice,
+    dp_id: str,
+    method_code: str,
+    object_suffix: str,
+    name: str,
+) -> None:
+    object_id = f"x5_{device.uid}_{object_suffix}_{dp_id}"
+    topic = lock_access_topic(device, method_code)
+    device.entities[object_id] = EntitySpec(
+        component="sensor",
+        object_id=object_id,
+        dp_id=dp_id,
+        kind="lock_access",
+        config={
+            "name": name,
+            "unique_id": object_id,
+            "state_topic": topic,
+            "value_template": "{{ value_json.timestamp }}",
+            "json_attributes_topic": topic,
+            "device_class": "timestamp",
+            "entity_category": "diagnostic",
+            "device": device.ha_device,
+        },
+    )
 
 
 def add_last_event_entity(device: BridgeDevice) -> None:
@@ -1138,16 +1212,8 @@ def apply_known_product_profile(device: BridgeDevice) -> bool:
         suppress_raw_entities(device, {"1", "2", "5", "7", "9", "10", "41", "101"})
         add_lock_entity(device, "101")
         add_number_sensor(device, "10", "battery", "Bateria", "battery", "%", "measurement", "battery")
-        access_entities = (
-            ("1", "unlock_fingerprint", "Último acesso por biometria"),
-            ("2", "unlock_password", "Último acesso por senha"),
-            ("5", "unlock_card", "Último acesso por cartão"),
-            ("7", "unlock_key", "Último acesso por chave"),
-            ("41", "unlock_remote", "Último acesso remoto"),
-        )
-        for dp_id, suffix, name in access_entities:
-            add_number_sensor(device, dp_id, suffix, name)
-            device.entities[f"x5_{device.uid}_{suffix}_{dp_id}"].config["entity_category"] = "diagnostic"
+        for dp_id, (method_code, suffix, name) in LOCK_ACCESS_DPS.items():
+            add_lock_access_sensor(device, dp_id, method_code, suffix, name)
         add_enum_sensor(
             device,
             "9",
@@ -1347,6 +1413,7 @@ def publish_all_discovery(client: mqtt.Client) -> None:
     publish_gateway_discovery(client)
     for device in REGISTRY.all():
         publish_device_discovery(client, device)
+        publish_lock_access_history(client, device)
     publish_inventory(client)
 
 
@@ -1394,6 +1461,162 @@ def mqtt_client() -> mqtt.Client:
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
     return client
+
+
+def lock_access_epoch(payload: dict[str, Any]) -> float:
+    raw_epoch = payload.get("_epoch")
+    try:
+        if raw_epoch not in (None, ""):
+            return float(raw_epoch)
+    except (TypeError, ValueError):
+        pass
+    raw_timestamp = clean_text(payload.get("timestamp"))
+    if not raw_timestamp:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def cloud_timestamp_payload(value: Any) -> tuple[float, str]:
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        return 0.0, ""
+    if epoch > 10_000_000_000:
+        epoch /= 1000
+    return epoch, datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def merge_lock_access_history(
+    device: BridgeDevice,
+    history: dict[str, dict[str, Any]],
+) -> None:
+    for method_code, payload in history.items():
+        if method_code not in LOCK_ACCESS_CODES or not isinstance(payload, dict):
+            continue
+        current = device.lock_access_history.get(method_code)
+        if current is None or lock_access_epoch(payload) >= lock_access_epoch(current):
+            device.lock_access_history[method_code] = dict(payload)
+
+
+def publish_lock_access_payload(
+    client: mqtt.Client,
+    device: BridgeDevice,
+    method_code: str,
+    payload: dict[str, Any],
+) -> None:
+    if method_code not in LOCK_ACCESS_CODES:
+        return
+    public_payload = {
+        key: value
+        for key, value in payload.items()
+        if not key.startswith("_") and value not in (None, "")
+    }
+    client.publish(
+        lock_access_topic(device, method_code),
+        json.dumps(public_payload, ensure_ascii=False),
+        qos=1,
+        retain=True,
+    )
+
+
+def publish_lock_access_history(client: mqtt.Client, device: BridgeDevice) -> None:
+    if not is_yale_lia(device):
+        return
+    for method_code, payload in device.lock_access_history.items():
+        publish_lock_access_payload(client, device, method_code, payload)
+
+
+def publish_local_lock_access(
+    client: mqtt.Client,
+    device: BridgeDevice,
+    event: dict[str, Any],
+    dps: dict[str, Any],
+) -> None:
+    if not is_yale_lia(device):
+        return
+    received_at = clean_text(event.get("received_at")) or now_iso()
+    try:
+        epoch = datetime.fromisoformat(received_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        epoch = time.time()
+        received_at = datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+    for dp_id, value in dps.items():
+        access = LOCK_ACCESS_DPS.get(str(dp_id))
+        if access is None:
+            continue
+        method_code = access[0]
+        payload = {
+            "timestamp": received_at,
+            "method": LOCK_ACCESS_METHOD_NAMES[method_code],
+            "method_code": method_code,
+            "credential_id": value,
+            "source": "X5 local",
+            "_epoch": epoch,
+        }
+        merge_lock_access_history(device, {method_code: payload})
+        publish_lock_access_payload(client, device, method_code, payload)
+
+
+def fetch_lock_access_history(
+    cloud: tinytuya.Cloud,
+    device_id: str,
+) -> dict[str, dict[str, Any]]:
+    end_time = int(time.time())
+    response = cloud.cloudrequest(
+        f"/v1.0/devices/{device_id}/door-lock/open-logs",
+        action="GET",
+        query={
+            "page_no": 1,
+            "page_size": LOCK_HISTORY_PAGE_SIZE,
+            "start_time": end_time - LOCK_HISTORY_LOOKBACK_SECONDS,
+            "end_time": end_time,
+        },
+    )
+    if not isinstance(response, dict):
+        raise RuntimeError(f"Resposta inesperada: {type(response).__name__}")
+    if response.get("success") is False or "Error" in response:
+        message = response.get("msg") or response.get("Error") or response.get("code") or "erro desconhecido"
+        raise RuntimeError(str(message))
+    result = response.get("result")
+    logs = result.get("logs") if isinstance(result, dict) else None
+    if not isinstance(logs, list):
+        return {}
+
+    history: dict[str, dict[str, Any]] = {}
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        epoch, timestamp = cloud_timestamp_payload(item.get("update_time"))
+        if not timestamp:
+            continue
+        statuses = item.get("status") or []
+        if isinstance(statuses, dict):
+            statuses = [statuses]
+        if not isinstance(statuses, list):
+            continue
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            method_code = clean_text(status.get("code") or status.get("dp_code"))
+            if method_code not in LOCK_ACCESS_CODES:
+                continue
+            payload = {
+                "timestamp": timestamp,
+                "method": LOCK_ACCESS_METHOD_NAMES[method_code],
+                "method_code": method_code,
+                "credential_id": status.get("value"),
+                "user_name": clean_text(item.get("nick_name")),
+                "credential_name": clean_text(item.get("unlock_name")),
+                "source": "Tuya Cloud",
+                "_epoch": epoch,
+            }
+            current = history.get(method_code)
+            if current is None or epoch >= lock_access_epoch(current):
+                history[method_code] = payload
+    return history
 
 
 def cloud_enabled() -> bool:
@@ -1457,6 +1680,18 @@ def fetch_cloud_devices() -> list[dict[str, Any]]:
                 meta["mapping"] = merge_mapping(base, enhanced)
         except Exception as exc:
             LOG.warning("Nao consegui obter especificacao Tuya de %s: %s", meta.get("name") or meta.get("id"), exc)
+        if is_yale_lia_meta(meta):
+            try:
+                meta["_lock_access_history"] = fetch_lock_access_history(
+                    cloud,
+                    str(meta["id"]),
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Nao consegui obter historico de acesso Tuya de %s: %s",
+                    meta.get("name") or meta.get("id"),
+                    exc,
+                )
     return result
 
 
@@ -1481,6 +1716,7 @@ def import_cloud_inventory(devices: list[dict[str, Any]], client: mqtt.Client | 
             imported += 1
             if client:
                 publish_device_discovery(client, device)
+                publish_lock_access_history(client, device)
     LOG.info("Inventario sincronizado: %s subdispositivo(s)", imported)
     if client:
         publish_inventory(client)
@@ -1653,7 +1889,9 @@ def publish_event(client: mqtt.Client, data: dict[str, Any]) -> None:
         event["device_id"] = device.id
         event["node_id"] = device.node_id
         client.publish(f"{device.topic_base}/event", json.dumps(event, ensure_ascii=False), qos=1, retain=True)
-        publish_dps(client, device, extract_dps(event))
+        dps = extract_dps(event)
+        publish_local_lock_access(client, device, event, dps)
+        publish_dps(client, device, dps)
         LOG.info("Evento de %s: %s", device.name, event)
     else:
         event["source"] = "gateway"

@@ -1,4 +1,4 @@
-# X5 Bridge 0.8.2
+# X5 Bridge 0.9.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 
@@ -25,7 +25,20 @@ Preencha:
 - `tuya_access_secret`: Access Secret do projeto Tuya Developer
 - `tuya_cloud_device_id`: Device ID do X5, ou outro device ID da mesma conta Tuya
 
-O controle e os eventos continuam locais pelo X5. A Tuya Cloud e usada apenas para atualizar o inventario.
+O controle e os eventos continuam locais pelo X5. A Tuya Cloud é usada para
+atualizar o inventário e, em perfis compatíveis, complementar dados que o
+gateway não fornece corretamente.
+
+## Yale LIA
+
+A Yale LIA recebe uma entidade `lock` local, bateria amigável e sensores de
+último acesso por biometria, senha, cartão, chave e comando remoto.
+
+Os sensores de acesso usam `/door-lock/open-logs` da Tuya Cloud como fonte de
+data e hora. Eventos recebidos localmente pelo X5 atualizam o timestamp
+imediatamente, e a sincronização periódica da nuvem recupera eventos ocorridos
+enquanto o bridge estava offline. O identificador numérico da credencial fica
+nos atributos da entidade e não é usado como estado.
 
 Durante a sincronizacao, o nome do dispositivo segue esta prioridade:
 

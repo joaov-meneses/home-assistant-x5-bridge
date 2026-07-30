@@ -1,3 +1,4 @@
+import json
 import queue
 import unittest
 
@@ -195,6 +196,17 @@ class EntityDiscoveryTests(unittest.TestCase):
         self.assertIn("x5_yale_device_battery_10", device.entities)
         self.assertIn("x5_yale_device_unlock_password_2", device.entities)
         self.assertIn("x5_yale_device_lock_alarm_9", device.entities)
+        password_access = device.entities["x5_yale_device_unlock_password_2"]
+        self.assertEqual(password_access.kind, "lock_access")
+        self.assertEqual(password_access.config["device_class"], "timestamp")
+        self.assertEqual(
+            password_access.config["state_topic"],
+            "x5/devices/yale_device/access/unlock_password",
+        )
+        self.assertEqual(
+            password_access.config["json_attributes_topic"],
+            password_access.config["state_topic"],
+        )
         self.assertEqual(
             device.suppressed_raw_dps,
             {"1", "2", "5", "7", "9", "10", "41", "101"},
@@ -270,6 +282,76 @@ class EntityDiscoveryTests(unittest.TestCase):
             if item["topic"] == "x5/devices/yale_device/lock/101"
         ]
         self.assertEqual(states, ["UNLOCKED", "LOCKED"])
+
+    def test_yale_lia_local_access_event_publishes_timestamp_instead_of_zero(self):
+        client = FakeMqttClient()
+        device = bridge.BridgeDevice(
+            id="yale-device",
+            node_id="00158d0000000001",
+            name="Yale Door Lock",
+            category="ms",
+            product_id="avdayhvk",
+            mapping=yale_lia_mapping(),
+        )
+
+        bridge.publish_local_lock_access(
+            client,
+            device,
+            {"received_at": "2026-07-30T20:17:23+00:00"},
+            {"41": 0},
+        )
+
+        message = next(
+            item
+            for item in client.messages
+            if item["topic"] == "x5/devices/yale_device/access/unlock_remote"
+        )
+        payload = json.loads(message["payload"])
+        self.assertEqual(payload["timestamp"], "2026-07-30T20:17:23+00:00")
+        self.assertEqual(payload["method"], "Remoto")
+        self.assertEqual(payload["credential_id"], 0)
+        self.assertEqual(payload["source"], "X5 local")
+        self.assertTrue(message["retain"])
+
+    def test_tuya_history_selects_latest_access_for_each_method(self):
+        class FakeCloud:
+            def cloudrequest(self, path, action=None, query=None):
+                self.path = path
+                self.action = action
+                self.query = query
+                return {
+                    "success": True,
+                    "result": {
+                        "logs": [
+                            {
+                                "update_time": 1785441456000,
+                                "nick_name": "",
+                                "unlock_name": "",
+                                "status": [{"code": "unlock_password", "value": "0"}],
+                            },
+                            {
+                                "update_time": 1785438050000,
+                                "nick_name": "João",
+                                "unlock_name": "Senha principal",
+                                "status": [{"code": "unlock_password", "value": "3"}],
+                            },
+                            {
+                                "update_time": 1785442643000,
+                                "status": [{"code": "unlock_remote", "value": "0"}],
+                            },
+                        ]
+                    },
+                }
+
+        cloud = FakeCloud()
+        history = bridge.fetch_lock_access_history(cloud, "yale-device")
+
+        self.assertEqual(cloud.action, "GET")
+        self.assertIn("/door-lock/open-logs", cloud.path)
+        self.assertEqual(cloud.query["page_no"], 1)
+        self.assertEqual(history["unlock_password"]["credential_id"], "0")
+        self.assertEqual(history["unlock_remote"]["method"], "Remoto")
+        self.assertTrue(history["unlock_password"]["timestamp"].endswith("+00:00"))
 
 
 class CommandQueueTests(unittest.TestCase):
