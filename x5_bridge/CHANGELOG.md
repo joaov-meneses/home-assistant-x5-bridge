@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1
+
+- Adiciona perfil nativo da fechadura Yale LIA.
+- Interpreta o DP 101 como estado da trava (`false` trancada e `true` destrancada).
+- Remove os DPs brutos duplicados, mantendo as entidades amigáveis da Yale LIA.
+- Cria uma entidade MQTT `lock` com comandos locais de trancar e destrancar.
+- Publica bateria, método do último acesso e alertas da fechadura.
+- Identifica fabricante e modelo como Yale LIA no Home Assistant.
+
 ## 0.8.0
 
 - Consulta localmente o X5 com `subdev_online_stat_query` a cada 30 segundos.

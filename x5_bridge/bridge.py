@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 
 def env(name: str, default: str = "") -> str:
@@ -433,9 +433,11 @@ class BridgeDevice:
     online: bool | None = None
     last_dps: dict[str, Any] = field(default_factory=dict)
     discovered_raw_dps: set[str] = field(default_factory=set)
+    suppressed_raw_dps: set[str] = field(default_factory=set)
     entities: dict[str, EntitySpec] = field(default_factory=dict)
     obsolete_discovery_topics: set[str] = field(default_factory=set)
     cover_cleanup_done: bool = False
+    lock_cleanup_done: bool = False
     cover_control_dp: str = ""
     cover_position_control_dp: str = ""
     cover_position_state_dp: str = ""
@@ -472,11 +474,15 @@ class BridgeDevice:
 
     @property
     def ha_device(self) -> dict[str, Any]:
+        is_yale_lia = self.product_id == "avdayhvk" or (
+            self.category.lower() == "ms"
+            and "yale door lock" in descriptor_for(self)
+        )
         return {
             "identifiers": [f"x5_{self.uid}"],
             "name": self.name or self.product_name or self.id,
-            "manufacturer": "Tuya/OEM",
-            "model": self.model or self.product_name or self.category or "Subdevice",
+            "manufacturer": "Yale" if is_yale_lia else "Tuya/OEM",
+            "model": "LIA" if is_yale_lia else self.model or self.product_name or self.category or "Subdevice",
             "via_device": "x5_bridge",
         }
 
@@ -767,6 +773,45 @@ def add_switch_entity(device: BridgeDevice, dp_id: str, name: str, entity_catego
     )
 
 
+def add_lock_entity(device: BridgeDevice, dp_id: str, name: str = "Fechadura") -> None:
+    object_id = f"x5_{device.uid}_lock_{dp_id}"
+    for existing_id, spec in list(device.entities.items()):
+        if existing_id != object_id and spec.dp_id == dp_id:
+            device.obsolete_discovery_topics.add(discovery_topic(spec))
+            del device.entities[existing_id]
+    if not device.lock_cleanup_done:
+        legacy_id = f"x5_{device.uid}_raw_dp_{dp_id}"
+        device.obsolete_discovery_topics.update(
+            {
+                f"homeassistant/sensor/{legacy_id}/config",
+                f"homeassistant/binary_sensor/{legacy_id}/config",
+            }
+        )
+        device.lock_cleanup_done = True
+    device.entities[object_id] = EntitySpec(
+        component="lock",
+        object_id=object_id,
+        dp_id=dp_id,
+        kind="lock",
+        config={
+            "name": name,
+            "unique_id": object_id,
+            "state_topic": f"{device.topic_base}/lock/{dp_id}",
+            "command_topic": dp_command_topic(device, dp_id),
+            "payload_lock": "false",
+            "payload_unlock": "true",
+            "state_locked": "LOCKED",
+            "state_unlocked": "UNLOCKED",
+            "optimistic": False,
+            "icon": "mdi:lock-smart",
+            "availability_topic": AVAILABILITY_TOPIC,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": device.ha_device,
+        },
+    )
+
+
 def add_number_control_entity(
     device: BridgeDevice,
     dp_id: str,
@@ -985,7 +1030,11 @@ def add_enum_sensor(
 
 
 def add_raw_entity(device: BridgeDevice, dp_id: str, value: Any) -> None:
-    if not CREATE_UNKNOWN_DP_ENTITIES or dp_id in device.discovered_raw_dps:
+    if (
+        not CREATE_UNKNOWN_DP_ENTITIES
+        or dp_id in device.discovered_raw_dps
+        or dp_id in device.suppressed_raw_dps
+    ):
         return
     if any(spec.dp_id == dp_id for spec in device.entities.values()):
         return
@@ -1028,6 +1077,26 @@ def add_raw_entity(device: BridgeDevice, dp_id: str, value: Any) -> None:
     )
 
 
+def suppress_raw_entities(device: BridgeDevice, dp_ids: set[str]) -> None:
+    """Remove raw MQTT entities that have a friendlier product-specific entity."""
+    normalized_dp_ids = {str(dp_id) for dp_id in dp_ids}
+    device.suppressed_raw_dps.update(normalized_dp_ids)
+
+    for object_id, spec in list(device.entities.items()):
+        if spec.kind == "raw" and spec.dp_id in normalized_dp_ids:
+            device.obsolete_discovery_topics.add(discovery_topic(spec))
+            del device.entities[object_id]
+
+    for dp_id in normalized_dp_ids:
+        legacy_id = f"x5_{device.uid}_raw_dp_{dp_id}"
+        device.obsolete_discovery_topics.update(
+            {
+                f"homeassistant/sensor/{legacy_id}/config",
+                f"homeassistant/binary_sensor/{legacy_id}/config",
+            }
+        )
+
+
 def has_command_entity(device: BridgeDevice, dp_id: str) -> bool:
     return any(
         spec.dp_id == dp_id and bool(spec.config.get("command_topic"))
@@ -1056,6 +1125,39 @@ def add_control_entity_from_mapping(device: BridgeDevice, dp_id: str) -> None:
 
 def apply_known_product_profile(device: BridgeDevice) -> bool:
     descriptor = descriptor_for(device)
+
+    # Yale LIA connected through Yale Connect/X5. Tuya's cloud specification
+    # omits DP 101, but the local Zigbee events use it as the deadbolt state:
+    # false = locked and true = unlocked. The same DP accepts boolean commands.
+    if device.product_id == "avdayhvk" or (
+        device.category.lower() == "ms"
+        and "yale door lock" in descriptor
+    ):
+        # The product-specific entities below supersede these generic DPs.
+        # Also clear retained MQTT discovery from older bridge versions.
+        suppress_raw_entities(device, {"1", "2", "5", "7", "9", "10", "41", "101"})
+        add_lock_entity(device, "101")
+        add_number_sensor(device, "10", "battery", "Bateria", "battery", "%", "measurement", "battery")
+        access_entities = (
+            ("1", "unlock_fingerprint", "Último acesso por biometria"),
+            ("2", "unlock_password", "Último acesso por senha"),
+            ("5", "unlock_card", "Último acesso por cartão"),
+            ("7", "unlock_key", "Último acesso por chave"),
+            ("41", "unlock_remote", "Último acesso remoto"),
+        )
+        for dp_id, suffix, name in access_entities:
+            add_number_sensor(device, dp_id, suffix, name)
+            device.entities[f"x5_{device.uid}_{suffix}_{dp_id}"].config["entity_category"] = "diagnostic"
+        add_enum_sensor(
+            device,
+            "9",
+            "lock_alarm",
+            "Último alerta",
+            "{{ {'Tamper': 'Violação detectada', 'Deadbolt_Jammed': "
+            "'Trava emperrada', 'Master_Code_Change': 'Código mestre alterado'}.get(value, value) }}",
+        )
+        device.entities[f"x5_{device.uid}_lock_alarm_9"].config["entity_category"] = "diagnostic"
+        return True
 
     # HOBEIAN/Moes ZG-223Z. Zigbee2MQTT exposes: rainwater, illuminance,
     # sensitivity, illuminance_sampling and battery. Tuya LAN reports the
@@ -1170,7 +1272,7 @@ def infer_entities(device: BridgeDevice) -> None:
             add_moisture_entity(device, dp_id, "Chuva detectada" if looks_like_rain else "Água detectada")
         elif "battery_percentage" in code:
             add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
-        elif code == "battery" or code.endswith("_battery"):
+        elif code in {"battery", "residual_electricity"} or code.endswith("_battery"):
             # Tuya frequently omits unit/max metadata for percentage battery
             # DPs. Treat numeric battery readings consistently in Home Assistant.
             add_number_sensor(device, dp_id, "battery", "Bateria", "battery", "%", "measurement", "battery")
@@ -1453,7 +1555,12 @@ def publish_entity_state(client: mqtt.Client, device: BridgeDevice, dp_id: str, 
     for spec in device.entities.values():
         if spec.dp_id != dp_id:
             continue
-        if spec.kind in {"contact", "motion", "switch"}:
+        if spec.kind == "lock":
+            normalized = normalize_on_off(value)
+            if normalized is not None:
+                state = "UNLOCKED" if normalized == "ON" else "LOCKED"
+                client.publish(spec.config["state_topic"], state, qos=1, retain=spec.retain_state)
+        elif spec.kind in {"contact", "motion", "switch"}:
             normalized = normalize_on_off(value)
             if normalized is not None:
                 client.publish(spec.config["state_topic"], normalized, qos=1, retain=spec.retain_state)
@@ -1647,6 +1754,14 @@ def parse_command_payload(device: BridgeDevice, spec: EntitySpec | None, dp_id: 
         if not 0 <= position <= 100:
             raise ValueError("posicao da cortina deve estar entre 0 e 100")
         return int(position) if position.is_integer() else position
+
+    if spec and spec.kind == "lock":
+        normalized = value.upper()
+        if normalized in {"UNLOCK", "UNLOCKED", "ON", "TRUE"}:
+            return True
+        if normalized in {"LOCK", "LOCKED", "OFF", "FALSE"}:
+            return False
+        raise ValueError("fechadura espera lock, unlock, true ou false")
 
     if spec and spec.kind == "switch":
         if value.upper() == "ON":
