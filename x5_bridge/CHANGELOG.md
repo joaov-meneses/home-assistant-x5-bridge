@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2
+
+- Aguarda o Supervisor registrar o servico MQTT antes de iniciar o bridge.
+- Evita o crash causado por uma porta MQTT vazia durante atualizacoes ou
+  reinicializacoes do Mosquitto broker.
+- Exibe um diagnostico claro quando o servico MQTT permanece indisponivel.
+
 ## 0.8.1
 
 - Adiciona perfil nativo da fechadura Yale LIA.
