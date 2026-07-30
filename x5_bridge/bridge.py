@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 
 
 def env(name: str, default: str = "") -> str:
