@@ -1,4 +1,4 @@
-# X5 Bridge 0.10.0
+# X5 Bridge 0.11.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 
@@ -55,6 +55,11 @@ Durante a sincronizacao, o nome do dispositivo segue esta prioridade:
 Uma alteracao de nome no app e aplicada no proximo ciclo de sincronizacao e
 republicada pelo MQTT Discovery. Um nome definido manualmente no proprio Home
 Assistant continua tendo prioridade visual no Home Assistant.
+
+Nos interruptores com varios canais, o nome personalizado de cada tecla tambem
+e consultado na sombra de propriedades da Tuya. Assim, nomes como `Lustre` ou
+`Portao Pedestres` substituem automaticamente `Switch 1`, `Switch 2` etc. Os
+IDs das entidades permanecem estaveis para nao quebrar dashboards e automacoes.
 
 ## Configuracao atual
 

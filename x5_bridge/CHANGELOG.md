@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.0
+
+- Sincroniza o nome personalizado de cada canal dos interruptores pela sombra
+  de propriedades da Tuya Cloud.
+- Republica os nomes por MQTT Discovery sem alterar os IDs das entidades.
+- Preserva o ultimo nome conhecido se uma consulta temporaria da nuvem falhar.
+
 ## 0.10.0
 
 - Adiciona perfil nativo para sirenes Zigbee Tuya com `alarm_switch`, incluindo

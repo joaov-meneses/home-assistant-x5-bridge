@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -287,6 +287,10 @@ def mapping_scale(mapping: dict[str, Any], dp_id: str) -> int:
 def mapping_item(mapping: dict[str, Any], dp_id: str) -> dict[str, Any]:
     item = mapping.get(str(dp_id), {})
     return item if isinstance(item, dict) else {}
+
+
+def mapping_custom_name(mapping: dict[str, Any], dp_id: str) -> str:
+    return clean_text(mapping_item(mapping, dp_id).get("custom_name"))
 
 
 def mapping_writable(mapping: dict[str, Any], dp_id: str) -> bool:
@@ -572,6 +576,21 @@ class Registry:
         device.model = clean_text(meta.get("model")) or device.model
         mapping = meta.get("mapping")
         if isinstance(mapping, dict):
+            # A temporary failure while reading the Tuya shadow must not make
+            # already synchronized channel names fall back to Switch 1, etc.
+            # A successful response includes custom_name explicitly, including
+            # an empty value when the name was removed in the Tuya app.
+            previous_mapping = device.mapping
+            normalized_mapping: dict[str, Any] = {}
+            for dp_id, item in mapping.items():
+                if not isinstance(item, dict):
+                    continue
+                normalized = dict(item)
+                previous = mapping_item(previous_mapping, str(dp_id))
+                if "custom_name" not in normalized and "custom_name" in previous:
+                    normalized["custom_name"] = previous.get("custom_name", "")
+                normalized_mapping[str(dp_id)] = normalized
+            mapping = normalized_mapping
             device.mapping = mapping
         history = meta.get("_lock_access_history")
         if isinstance(history, dict):
@@ -1230,7 +1249,7 @@ def add_control_entity_from_mapping(device: BridgeDevice, dp_id: str) -> None:
     dp_type = mapping_type(device.mapping, dp_id)
     values = mapping_values(device.mapping, dp_id)
     unit = str(values.get("unit") or "")
-    name = friendly_dp_name(code, f"DP {dp_id}")
+    name = mapping_custom_name(device.mapping, dp_id) or friendly_dp_name(code, f"DP {dp_id}")
 
     if dp_type == "boolean":
         add_switch_entity(device, dp_id, name, entity_category="config" if not code.startswith("switch") else None)
@@ -1406,7 +1425,9 @@ def infer_entities(device: BridgeDevice) -> None:
         elif "humidity" in code or code in {"va_humidity"}:
             add_number_sensor(device, dp_id, "humidity", "Umidade", "humidity", unit or "%", "measurement", "humidity")
         elif code.startswith("switch") and dp_type == "boolean":
-            name = "Interruptor" if code == "switch" else code.replace("_", " ").title()
+            name = mapping_custom_name(mapping, dp_id) or (
+                "Interruptor" if code == "switch" else code.replace("_", " ").title()
+            )
             add_switch_entity(device, dp_id, name)
         add_control_entity_from_mapping(device, dp_id)
 
@@ -1708,6 +1729,37 @@ def enrich_cloud_device_name(cloud: tinytuya.Cloud, meta: dict[str, Any]) -> Non
             meta[key] = clean_text(details.get(key))
 
 
+def enrich_cloud_dp_custom_names(cloud: tinytuya.Cloud, meta: dict[str, Any]) -> None:
+    device_id = clean_text(meta.get("id"))
+    if not device_id:
+        return
+    response = cloud.cloudrequest(f"/v2.0/cloud/thing/{device_id}/shadow/properties")
+    if not isinstance(response, dict):
+        raise RuntimeError(f"Resposta inesperada: {type(response).__name__}")
+    if response.get("success") is False or "Error" in response:
+        message = response.get("msg") or response.get("Error") or response.get("code") or "erro desconhecido"
+        raise RuntimeError(str(message))
+    result = response.get("result")
+    properties = result.get("properties") if isinstance(result, dict) else None
+    if not isinstance(properties, list):
+        raise RuntimeError("Resposta sem propriedades do dispositivo")
+
+    mapping = meta.get("mapping") if isinstance(meta.get("mapping"), dict) else {}
+    updated_mapping = {
+        str(dp_id): dict(item)
+        for dp_id, item in mapping.items()
+        if isinstance(item, dict)
+    }
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        dp_id = clean_text(prop.get("dp_id"))
+        if not dp_id or dp_id not in updated_mapping:
+            continue
+        updated_mapping[dp_id]["custom_name"] = clean_text(prop.get("custom_name"))
+    meta["mapping"] = updated_mapping
+
+
 def fetch_cloud_devices() -> list[dict[str, Any]]:
     cloud = tinytuya.Cloud(
         apiRegion=TUYA_REGION,
@@ -1739,6 +1791,16 @@ def fetch_cloud_devices() -> list[dict[str, Any]]:
                 meta["mapping"] = merge_mapping(base, enhanced)
         except Exception as exc:
             LOG.warning("Nao consegui obter especificacao Tuya de %s: %s", meta.get("name") or meta.get("id"), exc)
+        mapping = meta.get("mapping") if isinstance(meta.get("mapping"), dict) else {}
+        if any(mapping_code(mapping, str(dp_id)).startswith("switch") for dp_id in mapping):
+            try:
+                enrich_cloud_dp_custom_names(cloud, meta)
+            except Exception as exc:
+                LOG.warning(
+                    "Nao consegui obter nomes dos canais Tuya de %s: %s",
+                    meta.get("name") or meta.get("id"),
+                    exc,
+                )
         if is_yale_lia_meta(meta):
             try:
                 meta["_lock_access_history"] = fetch_lock_access_history(
