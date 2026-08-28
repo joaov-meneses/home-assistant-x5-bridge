@@ -43,6 +43,16 @@ class FakeGateway:
         return self.heartbeat_result
 
 
+class FakeCloud:
+    def __init__(self, response) -> None:
+        self.response = response
+        self.paths = []
+
+    def cloudrequest(self, path):
+        self.paths.append(path)
+        return self.response
+
+
 def curtain_mapping():
     return {
         "1": {
@@ -135,6 +145,82 @@ class EntityDiscoveryTests(unittest.TestCase):
         self.assertEqual(spec.component, "sensor")
         self.assertEqual(spec.config["name"], "DP 99")
         self.assertEqual(spec.config["state_topic"], "x5/devices/raw_device/raw/99")
+
+    def test_switch_uses_tuya_channel_custom_name(self):
+        device = bridge.BridgeDevice(
+            id="wall-switch",
+            node_id="switch-node",
+            name="Interruptor Sala",
+            mapping={
+                "1": {
+                    "code": "switch_1",
+                    "type": "boolean",
+                    "writable": True,
+                    "custom_name": "Lustre",
+                }
+            },
+        )
+
+        bridge.infer_entities(device)
+
+        switch = device.entities["x5_wall_switch_switch_1"]
+        self.assertEqual(switch.config["name"], "Lustre")
+
+    def test_cloud_shadow_names_are_added_to_mapping(self):
+        cloud = FakeCloud(
+            {
+                "success": True,
+                "result": {
+                    "properties": [
+                        {"dp_id": 1, "code": "switch_1", "custom_name": "Lustre"},
+                        {"dp_id": 2, "code": "switch_2", "custom_name": ""},
+                    ]
+                },
+            }
+        )
+        meta = {
+            "id": "wall-switch",
+            "mapping": {
+                "1": {"code": "switch_1", "type": "boolean"},
+                "2": {"code": "switch_2", "type": "boolean"},
+            },
+        }
+
+        bridge.enrich_cloud_dp_custom_names(cloud, meta)
+
+        self.assertEqual(
+            cloud.paths,
+            ["/v2.0/cloud/thing/wall-switch/shadow/properties"],
+        )
+        self.assertEqual(meta["mapping"]["1"]["custom_name"], "Lustre")
+        self.assertEqual(meta["mapping"]["2"]["custom_name"], "")
+
+    def test_registry_preserves_channel_name_when_shadow_query_is_missing(self):
+        registry = bridge.Registry()
+        registry.add_or_update(
+            {
+                "id": "wall-switch",
+                "node_id": "switch-node",
+                "mapping": {
+                    "1": {
+                        "code": "switch_1",
+                        "type": "boolean",
+                        "custom_name": "Lustre",
+                    }
+                },
+            }
+        )
+
+        device = registry.add_or_update(
+            {
+                "id": "wall-switch",
+                "node_id": "switch-node",
+                "mapping": {"1": {"code": "switch_1", "type": "boolean"}},
+            }
+        )
+
+        self.assertIsNotNone(device)
+        self.assertEqual(device.mapping["1"]["custom_name"], "Lustre")
 
     def test_tuya_curtain_mapping_creates_native_cover(self):
         device = bridge.BridgeDevice(
