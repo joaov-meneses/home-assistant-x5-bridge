@@ -17,7 +17,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -387,6 +387,9 @@ def friendly_dp_name(code: str, fallback: str) -> str:
         "indicator": "Indicador",
         "led": "LED",
         "power_on_behavior": "Comportamento ao energizar",
+        "alarm_volume": "Volume do alarme",
+        "alarm_time": "Duração do alarme",
+        "alarm_switch": "Sirene",
         "mode": "Modo",
     }
     normalized = code.strip().lower()
@@ -479,6 +482,7 @@ class BridgeDevice:
     obsolete_discovery_topics: set[str] = field(default_factory=set)
     cover_cleanup_done: bool = False
     lock_cleanup_done: bool = False
+    siren_cleanup_done: bool = False
     cover_control_dp: str = ""
     cover_position_control_dp: str = ""
     cover_position_state_dp: str = ""
@@ -847,6 +851,47 @@ def add_switch_entity(device: BridgeDevice, dp_id: str, name: str, entity_catego
     )
 
 
+def add_siren_entity(device: BridgeDevice, dp_id: str, name: str = "Sirene") -> None:
+    object_id = f"x5_{device.uid}_siren_{dp_id}"
+    for existing_id, spec in list(device.entities.items()):
+        if existing_id != object_id and spec.dp_id == dp_id:
+            device.obsolete_discovery_topics.add(discovery_topic(spec))
+            del device.entities[existing_id]
+    if not device.siren_cleanup_done:
+        legacy_switch_id = f"x5_{device.uid}_switch_{dp_id}"
+        legacy_raw_id = f"x5_{device.uid}_raw_dp_{dp_id}"
+        device.obsolete_discovery_topics.update(
+            {
+                f"homeassistant/switch/{legacy_switch_id}/config",
+                f"homeassistant/sensor/{legacy_raw_id}/config",
+                f"homeassistant/binary_sensor/{legacy_raw_id}/config",
+            }
+        )
+        device.siren_cleanup_done = True
+    device.entities[object_id] = EntitySpec(
+        component="siren",
+        object_id=object_id,
+        dp_id=dp_id,
+        kind="siren",
+        config={
+            "name": name,
+            "unique_id": object_id,
+            "state_topic": f"{device.topic_base}/siren/{dp_id}",
+            "command_topic": dp_command_topic(device, dp_id),
+            "command_template": "{{ value }}",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "state_on": "ON",
+            "state_off": "OFF",
+            "optimistic": False,
+            "availability_topic": AVAILABILITY_TOPIC,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": device.ha_device,
+        },
+    )
+
+
 def add_lock_entity(device: BridgeDevice, dp_id: str, name: str = "Fechadura") -> None:
     object_id = f"x5_{device.uid}_lock_{dp_id}"
     for existing_id, spec in list(device.entities.items()):
@@ -1199,6 +1244,20 @@ def add_control_entity_from_mapping(device: BridgeDevice, dp_id: str) -> None:
 
 def apply_known_product_profile(device: BridgeDevice) -> bool:
     descriptor = descriptor_for(device)
+
+    # Tuya Zigbee sirens such as the NAS-AB02B2 expose an alarm switch plus
+    # independent volume and duration DPs. Publish the main alarm DP through
+    # Home Assistant's native siren domain; the remaining writable DPs are
+    # still discovered as select/number controls by the generic mapping loop.
+    alarm_switch_dp = dp_for_codes(device.mapping, {"alarm_switch"})
+    if alarm_switch_dp and (
+        device.product_id == "t1blo2bj"
+        or device.category.lower() == "sgbj"
+        or any(token in descriptor for token in ("siren", "sirene", "audible alarm"))
+    ):
+        suppress_raw_entities(device, {alarm_switch_dp})
+        add_siren_entity(device, alarm_switch_dp)
+        return True
 
     # Yale LIA connected through Yale Connect/X5. Tuya's cloud specification
     # omits DP 101, but the local Zigbee events use it as the deadbolt state:
@@ -1796,7 +1855,7 @@ def publish_entity_state(client: mqtt.Client, device: BridgeDevice, dp_id: str, 
             if normalized is not None:
                 state = "UNLOCKED" if normalized == "ON" else "LOCKED"
                 client.publish(spec.config["state_topic"], state, qos=1, retain=spec.retain_state)
-        elif spec.kind in {"contact", "motion", "switch"}:
+        elif spec.kind in {"contact", "motion", "switch", "siren"}:
             normalized = normalize_on_off(value)
             if normalized is not None:
                 client.publish(spec.config["state_topic"], normalized, qos=1, retain=spec.retain_state)
@@ -2001,14 +2060,14 @@ def parse_command_payload(device: BridgeDevice, spec: EntitySpec | None, dp_id: 
             return False
         raise ValueError("fechadura espera lock, unlock, true ou false")
 
-    if spec and spec.kind == "switch":
+    if spec and spec.kind in {"switch", "siren"}:
         if value.upper() == "ON":
             return True
         if value.upper() == "OFF":
             return False
         parsed = json.loads(value)
         if not isinstance(parsed, bool):
-            raise ValueError("switch espera ON, OFF, true ou false")
+            raise ValueError(f"{spec.kind} espera ON, OFF, true ou false")
         return parsed
 
     if spec and spec.kind == "number_control":

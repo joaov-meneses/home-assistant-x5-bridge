@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0
+
+- Adiciona perfil nativo para sirenes Zigbee Tuya com `alarm_switch`, incluindo
+  a NAS-AB02B2.
+- Substitui o switch genérico do alarme por uma entidade MQTT `siren`.
+- Mantém volume, duração e bateria como controles e sensores auxiliares.
+- Remove automaticamente o MQTT Discovery retido da entidade switch antiga.
+
 ## 0.9.0
 
 - Substitui os valores numéricos de último acesso da Yale LIA por timestamps do

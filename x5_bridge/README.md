@@ -1,4 +1,4 @@
-# X5 Bridge 0.9.0
+# X5 Bridge 0.10.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 
@@ -39,6 +39,12 @@ data e hora. Eventos recebidos localmente pelo X5 atualizam o timestamp
 imediatamente, e a sincronização periódica da nuvem recupera eventos ocorridos
 enquanto o bridge estava offline. O identificador numérico da credencial fica
 nos atributos da entidade e não é usado como estado.
+
+## Sirenes
+
+Sirenes Zigbee Tuya com o DP `alarm_switch`, incluindo a NAS-AB02B2, são
+publicadas no domínio nativo `siren`. Volume e duração permanecem disponíveis
+como controles `select` e `number`, e a bateria é publicada como percentual.
 
 Durante a sincronizacao, o nome do dispositivo segue esta prioridade:
 
@@ -86,6 +92,6 @@ Perfil local incluido:
 
 - Gateway X5: conexao local e inventario.
 - Dispositivos descobertos: ultimo evento.
-- DPs reconhecidos: porta, movimento, água/chuva/vazamento, iluminância, bateria, temperatura, umidade e switches.
+- DPs reconhecidos: porta, movimento, água/chuva/vazamento, iluminância, bateria, temperatura, umidade, switches e sirenes.
 - DPs gravaveis reconhecidos: switches, numeros, selects e textos com comandos enviados de volta ao X5 por Tuya LAN.
 - DPs desconhecidos: entidades diagnosticas, quando `create_unknown_dp_entities` estiver ativo.

@@ -93,6 +93,34 @@ def yale_lia_mapping():
     }
 
 
+def audible_alarm_mapping():
+    return {
+        "5": {
+            "code": "alarm_volume",
+            "type": "enum",
+            "values": {"range": ["low", "middle", "high"]},
+            "writable": True,
+        },
+        "7": {
+            "code": "alarm_time",
+            "type": "integer",
+            "values": {"unit": "s", "min": 0, "max": 1800, "step": 10, "scale": 0},
+            "writable": True,
+        },
+        "13": {
+            "code": "alarm_switch",
+            "type": "boolean",
+            "values": {},
+            "writable": True,
+        },
+        "15": {
+            "code": "battery_percentage",
+            "type": "integer",
+            "values": {"unit": "%", "min": 0, "max": 100, "step": 1, "scale": 0},
+        },
+    }
+
+
 class EntityDiscoveryTests(unittest.TestCase):
     def test_raw_entity_keeps_its_discovery_config(self):
         device = bridge.BridgeDevice(
@@ -220,6 +248,66 @@ class EntityDiscoveryTests(unittest.TestCase):
                 f"homeassistant/binary_sensor/x5_yale_device_raw_dp_{dp_id}/config",
                 device.obsolete_discovery_topics,
             )
+
+    def test_audible_alarm_profile_creates_native_siren_and_controls(self):
+        device = bridge.BridgeDevice(
+            id="audible-alarm",
+            node_id="a4c1380000000001",
+            name="Audible alarm",
+            category="sgbj",
+            product_name="Audible alarm",
+            product_id="t1blo2bj",
+            model="NAS-AB02B2",
+            mapping=audible_alarm_mapping(),
+        )
+
+        bridge.infer_entities(device)
+
+        siren = device.entities["x5_audible_alarm_siren_13"]
+        self.assertEqual(siren.component, "siren")
+        self.assertEqual(siren.kind, "siren")
+        self.assertEqual(siren.config["command_topic"], "x5/devices/audible_alarm/set/13")
+        self.assertEqual(siren.config["command_template"], "{{ value }}")
+        self.assertEqual(siren.config["payload_on"], "ON")
+        self.assertEqual(siren.config["payload_off"], "OFF")
+        self.assertIn("x5_audible_alarm_select_5", device.entities)
+        self.assertEqual(
+            device.entities["x5_audible_alarm_select_5"].config["name"],
+            "Volume do alarme",
+        )
+        self.assertIn("x5_audible_alarm_number_7", device.entities)
+        self.assertEqual(
+            device.entities["x5_audible_alarm_number_7"].config["unit_of_measurement"],
+            "s",
+        )
+        self.assertIn("x5_audible_alarm_battery_15", device.entities)
+        self.assertNotIn("x5_audible_alarm_switch_13", device.entities)
+        self.assertIn(
+            "homeassistant/switch/x5_audible_alarm_switch_13/config",
+            device.obsolete_discovery_topics,
+        )
+
+    def test_audible_alarm_state_is_published_on_native_siren_topic(self):
+        client = FakeMqttClient()
+        device = bridge.BridgeDevice(
+            id="audible-alarm",
+            node_id="a4c1380000000001",
+            name="Audible alarm",
+            category="sgbj",
+            product_id="t1blo2bj",
+            mapping=audible_alarm_mapping(),
+        )
+        bridge.infer_entities(device)
+
+        bridge.publish_entity_state(client, device, "13", True)
+        bridge.publish_entity_state(client, device, "13", False)
+
+        states = [
+            item["payload"]
+            for item in client.messages
+            if item["topic"] == "x5/devices/audible_alarm/siren/13"
+        ]
+        self.assertEqual(states, ["ON", "OFF"])
 
     def test_yale_lia_profile_does_not_recreate_suppressed_raw_dps(self):
         client = FakeMqttClient()
@@ -435,6 +523,31 @@ class CommandQueueTests(unittest.TestCase):
         self.assertEqual(local.calls, [("101", False, True)])
         self.assertIn(
             ("x5/devices/yale_device/lock/101", "LOCKED"),
+            {(item["topic"], item["payload"]) for item in client.messages},
+        )
+
+    def test_native_siren_command_is_sent_as_boolean(self):
+        client = FakeMqttClient()
+        local = FakeLocalDevice()
+        device = bridge.BridgeDevice(
+            id="audible-alarm",
+            node_id="a4c1380000000001",
+            name="Audible alarm",
+            category="sgbj",
+            product_id="t1blo2bj",
+            mapping=audible_alarm_mapping(),
+            local=local,
+        )
+        bridge.REGISTRY.by_id[device.id] = device
+        bridge.REGISTRY.by_cid[device.node_id] = device
+        bridge.infer_entities(device)
+
+        bridge.handle_command(client, "x5/devices/audible_alarm/set/13", "ON")
+        bridge.process_pending_commands(client)
+
+        self.assertEqual(local.calls, [("13", True, True)])
+        self.assertIn(
+            ("x5/devices/audible_alarm/siren/13", "ON"),
             {(item["topic"], item["payload"]) for item in client.messages},
         )
 
