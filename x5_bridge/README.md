@@ -1,4 +1,4 @@
-# X5 Bridge 0.11.0
+# X5 Bridge 0.12.0
 
 Bridge local entre o gateway Tuya X5 e o Home Assistant via MQTT.
 
@@ -16,6 +16,19 @@ especificação Tuya (`control`, `percent_control`, `percent_state` e
 não fornecem o mapeamento completo.
 
 ## Auto sync
+
+O ultimo inventario valido e salvo em `/config/inventory.json`, na pasta de
+configuracao exclusiva do add-on. Esse arquivo aparece no compartilhamento
+`addon_configs/<slug-do-add-on>/inventory.json` e acompanha os backups do app.
+Ele contem IDs e mapeamentos dos dispositivos, sem chaves locais ou credenciais
+da Tuya. O bridge carrega esse cadastro antes de iniciar a consulta da nuvem.
+Uma falha da Tuya nao interrompe o controle LAN dos dispositivos ja cadastrados.
+
+Se a Tuya recusar consultas por cota ou assinatura expirada, o bridge preserva
+o cadastro e aguarda pelo menos seis horas para tentar novamente. A descoberta
+de dispositivos novos e a sincronizacao dos nomes precisam voltar a ter acesso
+a nuvem. Numa instalacao sem cache anterior, uma consulta valida ou a restauracao
+de um arquivo de inventario e necessaria para recuperar o cadastro.
 
 Preencha:
 
