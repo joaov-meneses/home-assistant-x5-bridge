@@ -11,13 +11,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 
 def env(name: str, default: str = "") -> str:
@@ -52,6 +53,7 @@ MQTT_USERNAME = env("MQTT_USERNAME")
 MQTT_PASSWORD = env("MQTT_PASSWORD")
 TOPIC_PREFIX = env("TOPIC_PREFIX", "x5").strip("/")
 DEBUG = env_bool("DEBUG")
+INVENTORY_CACHE_PATH = Path(env("INVENTORY_CACHE_PATH", "/config/inventory.json"))
 
 AVAILABILITY_TOPIC = f"{TOPIC_PREFIX}/bridge/availability"
 INVENTORY_TOPIC = f"{TOPIC_PREFIX}/inventory"
@@ -93,6 +95,8 @@ COMMAND_QUEUE: queue.Queue[tuple[str, str, Any]] = queue.Queue()
 SYNC_RESULT_QUEUE: queue.Queue[tuple[list[dict[str, Any]] | None, Exception | None]] = queue.Queue()
 SYNC_THREAD_LOCK = threading.Lock()
 SYNC_THREAD: threading.Thread | None = None
+NEXT_SYNC_ALLOWED_AT = 0.0
+SYNC_FAILURES = 0
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -560,7 +564,12 @@ class Registry:
             self.by_cid[node_id] = device
 
         previous_name = device.name
+        previous_node_id = device.node_id
         device.node_id = node_id
+        if previous_node_id != node_id:
+            self.by_cid.pop(previous_node_id, None)
+            device.local = None
+        self.by_cid[node_id] = device
         if "custom_name" in meta:
             device.custom_name = clean_text(meta.get("custom_name"))
         device.name = (
@@ -1703,6 +1712,59 @@ def cloud_enabled() -> bool:
     return bool(AUTO_SYNC and TUYA_ACCESS_ID and TUYA_ACCESS_SECRET and TUYA_CLOUD_DEVICE_ID)
 
 
+def save_inventory_cache() -> None:
+    """Persist only inventory metadata; never cloud credentials or device keys."""
+    if not REGISTRY.by_id:
+        return
+    devices = []
+    for device in REGISTRY.all():
+        meta = {key: getattr(device, key) for key in (
+            "id", "node_id", "name", "custom_name", "category", "product_name",
+            "product_id", "model", "mapping",
+        )}
+        meta.update(sub=True, parent=X5_DEVICE_ID)
+        devices.append(meta)
+    payload = {"version": 1, "gateway_id": X5_DEVICE_ID,
+               "updated_at": now_iso(), "devices": devices}
+    temporary = INVENTORY_CACHE_PATH.with_suffix(".json.tmp")
+    try:
+        INVENTORY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(INVENTORY_CACHE_PATH)
+    except OSError as exc:
+        LOG.error("Nao consegui salvar inventario local em %s: %s", INVENTORY_CACHE_PATH, exc)
+
+
+def load_inventory_cache() -> int:
+    try:
+        payload = json.loads(INVENTORY_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("formato de cache invalido")
+        if payload.get("gateway_id") != X5_DEVICE_ID:
+            raise ValueError("cache pertence a outro gateway")
+        devices = payload.get("devices")
+        if not isinstance(devices, list):
+            raise ValueError("lista de dispositivos invalida")
+        # Validate the complete file before modifying the active registry.
+        validated = []
+        for meta in devices:
+            if (not isinstance(meta, dict) or not meta.get("id")
+                    or not should_import_cloud_device(meta)):
+                raise ValueError("dispositivo invalido ou de outro gateway")
+            if not isinstance(meta.get("mapping", {}), dict):
+                raise ValueError("mapeamento de dispositivo invalido")
+            validated.append(meta)
+        for meta in validated:
+            REGISTRY.add_or_update(meta)
+        LOG.info("Inventario local restaurado: %s subdispositivo(s)", len(validated))
+        return len(validated)
+    except FileNotFoundError:
+        LOG.info("Ainda nao existe inventario local em %s", INVENTORY_CACHE_PATH)
+    except (OSError, ValueError, TypeError) as exc:
+        LOG.error("Nao consegui carregar inventario local: %s", exc)
+    return 0
+
+
 def enrich_cloud_device_name(cloud: tinytuya.Cloud, meta: dict[str, Any]) -> None:
     device_id = clean_text(meta.get("id"))
     if not device_id:
@@ -1769,7 +1831,10 @@ def fetch_cloud_devices() -> list[dict[str, Any]]:
     )
     result = cloud.getdevices(include_map=True)
     if isinstance(result, dict) and "Error" in result:
-        raise RuntimeError(result.get("Error", "Erro desconhecido da Tuya Cloud"))
+        detail = result.get("Payload", {})
+        if isinstance(detail, dict):
+            raise RuntimeError(f"{result['Error']}: {detail.get('code', '')} {detail.get('msg', '')}")
+        raise RuntimeError(result["Error"])
     if not isinstance(result, list):
         raise RuntimeError(f"Resposta inesperada da Tuya Cloud: {type(result).__name__}")
     for meta in result:
@@ -1839,6 +1904,8 @@ def import_cloud_inventory(devices: list[dict[str, Any]], client: mqtt.Client | 
                 publish_device_discovery(client, device)
                 publish_lock_access_history(client, device)
     LOG.info("Inventario sincronizado: %s subdispositivo(s)", imported)
+    if imported:
+        save_inventory_cache()
     if client:
         publish_inventory(client)
 
@@ -1856,12 +1923,17 @@ def sync_inventory(client: mqtt.Client | None = None) -> None:
 
 
 def start_inventory_sync() -> None:
-    global SYNC_THREAD
+    global SYNC_THREAD, NEXT_SYNC_ALLOWED_AT
     if not cloud_enabled():
         return
     with SYNC_THREAD_LOCK:
         if SYNC_THREAD and SYNC_THREAD.is_alive():
             return
+        current = time.monotonic()
+        if current < NEXT_SYNC_ALLOWED_AT:
+            return
+        # Unknown local events must not trigger a new full cloud scan each time.
+        NEXT_SYNC_ALLOWED_AT = current + max(60, SYNC_INTERVAL_MINUTES * 60)
 
         def worker() -> None:
             try:
@@ -1880,14 +1952,23 @@ def start_inventory_sync() -> None:
 
 
 def process_inventory_sync_results(client: mqtt.Client) -> None:
+    global SYNC_FAILURES, NEXT_SYNC_ALLOWED_AT
     while True:
         try:
             devices, error = SYNC_RESULT_QUEUE.get_nowait()
         except queue.Empty:
             return
         if error:
-            LOG.error("Falha ao sincronizar inventario: %s", error)
+            SYNC_FAILURES = min(SYNC_FAILURES + 1, 8)
+            quota_error = any(value in str(error).lower() for value in (
+                "28841004", "28841104", "quota", "28841002",
+            ))
+            delay = 6 * 3600 if quota_error else min(300 * (2 ** (SYNC_FAILURES - 1)), 3600)
+            NEXT_SYNC_ALLOWED_AT = max(NEXT_SYNC_ALLOWED_AT, time.monotonic() + delay)
+            LOG.error("Falha ao sincronizar inventario: %s; cadastro local preservado (%s dispositivos); "
+                      "nova tentativa em pelo menos %s s", error, len(REGISTRY.by_id), delay)
             continue
+        SYNC_FAILURES = 0
         import_cloud_inventory(devices or [], client)
 
 
@@ -2300,11 +2381,9 @@ def main() -> int:
     validate()
     if DEBUG:
         tinytuya.set_debug(True, color=False)
-    try:
-        sync_inventory(None)
-    except Exception:
-        LOG.exception("Falha na sincronizacao inicial; continuarei com os dispositivos ja configurados")
+    load_inventory_cache()
     client = mqtt_client()
+    start_inventory_sync()
     try:
         listen_forever(client)
     finally:

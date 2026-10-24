@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0
+
+- Salva o inventario e os mapeamentos em disco, carregando-os antes de conectar
+  ao X5 e ao MQTT. Reinicios deixam de depender da disponibilidade da Tuya Cloud.
+- Preserva o cadastro local quando a nuvem falha ou retorna uma lista vazia.
+- Limita consultas disparadas por eventos desconhecidos e aguarda seis horas
+  apos erros de cota ou assinatura expirada.
+- Executa a consulta inicial da nuvem em segundo plano e atualiza o roteamento
+  local quando o node ID de um dispositivo muda.
+
 ## 0.11.0
 
 - Sincroniza o nome personalizado de cada canal dos interruptores pela sombra
