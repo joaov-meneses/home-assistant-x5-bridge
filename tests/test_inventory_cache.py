@@ -80,6 +80,18 @@ class InventoryCacheTests(unittest.TestCase):
         self.assertIs(bridge.REGISTRY.by_cid["new-node"], device)
         self.assertIsNone(device.local)
 
+    def test_tinytuya_string_payload_preserves_quota_error_for_backoff(self):
+        response = {"Error": "Error Response from Tuya Cloud", "Err": "913",
+                    "Payload": "Error from Tuya Cloud: Code 28841004: 'IoT Core trial quota is exhausted.'"}
+        with patch.object(bridge.tinytuya, "Cloud") as cloud:
+            cloud.return_value.getdevices.return_value = response
+            with self.assertRaisesRegex(RuntimeError, "28841004") as error:
+                bridge.fetch_cloud_devices()
+        bridge.SYNC_RESULT_QUEUE.put((None, error.exception))
+        with patch.object(bridge.time, "monotonic", return_value=1000):
+            bridge.process_inventory_sync_results(None)
+        self.assertEqual(bridge.NEXT_SYNC_ALLOWED_AT, 22600)
+
 
 if __name__ == "__main__":
     unittest.main()

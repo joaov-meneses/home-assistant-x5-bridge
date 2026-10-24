@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.1
+
+- Reconhece o erro de cota encapsulado como texto pelo TinyTuya 1.20 e aplica
+  a pausa de seis horas tambem a esse formato de resposta.
+
 ## 0.12.0
 
 - Salva o inventario e os mapeamentos em disco, carregando-os antes de conectar

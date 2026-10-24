@@ -18,7 +18,7 @@ import paho.mqtt.client as mqtt
 import tinytuya
 
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 
 
 def env(name: str, default: str = "") -> str:
@@ -1834,7 +1834,8 @@ def fetch_cloud_devices() -> list[dict[str, Any]]:
         detail = result.get("Payload", {})
         if isinstance(detail, dict):
             raise RuntimeError(f"{result['Error']}: {detail.get('code', '')} {detail.get('msg', '')}")
-        raise RuntimeError(result["Error"])
+        # TinyTuya 1.20 wraps device-lookup failures in a string Payload.
+        raise RuntimeError(f"{result['Error']}: {str(detail)[:300]}")
     if not isinstance(result, list):
         raise RuntimeError(f"Resposta inesperada da Tuya Cloud: {type(result).__name__}")
     for meta in result:
